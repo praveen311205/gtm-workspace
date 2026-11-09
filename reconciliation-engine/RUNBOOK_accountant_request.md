@@ -5,15 +5,14 @@ roughly every 6 weeks. A scheduled Claude session checks the mailbox twice a
 week and, when a new request is in, answers it with this tool. It **never
 sends**: the result is a Gmail draft reply that a person reviews and sends.
 
-Everything persistent lives in the Google Drive folder
-**"Reconciliation Engine (Claude)"**:
+The code lives in GitHub: `praveen311205/gtm-workspace`, folder
+`reconciliation-engine/`. Financial data never goes into git; it lives in the
+Google Drive folder **"Reconciliation Engine (Claude)"**:
 
 | File | What |
 |---|---|
-| `reconciliation-engine.zip` | This tool (newest upload wins) |
 | `ledger-YYYY-MM-DD.json` | Ledger after each answered request (newest wins) |
 | `report-request-YYYY-MM-DD.txt` | The full report of each answered request |
-| `RUNBOOK_accountant_request.md` | This file |
 
 ## 1. Is there a new request?
 
@@ -59,8 +58,9 @@ notices, reminders and summaries itself.
 
 ## 4. Run the tool
 
-Download the newest `reconciliation-engine.zip` and `ledger-*.json` from the
-Drive folder (no ledger yet = start without one), then:
+Clone the repo (`git clone --depth 1 https://github.com/praveen311205/gtm-workspace`),
+download the newest `ledger-*.json` from the Drive folder as `ledger.json`
+(no ledger yet = start without one), then, in `reconciliation-engine/`:
 
 ```bash
 python -m pip install -q pypdf
