@@ -1,0 +1,6 @@
+{
+  "name": "gtm-software-inventory",
+  "version": "0.1.0",
+  "description": "Builds and maintains GTM Talent's software inventory from billing emails and archived invoice PDFs: plan, cost, billing cycle, renewal and cancel-by dates, notice period, payment card, owner and overlaps, written to a Google Sheet.",
+  "author": { "name": "GTM Talent" }
+}
