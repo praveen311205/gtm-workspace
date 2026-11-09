@@ -1,0 +1,8 @@
+# Secrets
+credentials.json
+token.json
+.env
+# OS / editor
+.DS_Store
+__pycache__/
+*.pyc

@@ -1,0 +1,32 @@
+case,status,row,id,date,amount,text_or_vendor,doc_type,direction,vat,expect_status,expect_docs,expect_type,note
+brief_baseline,must_pass,txn,T1,2026-09-03,-90.00,ANTHROPIC,,,,FULL,Anthropic_Receipt_2026-09-03.pdf,,Exercise data from the brief
+brief_baseline,must_pass,txn,T2,2026-09-05,-99.00,LEMLIST,,,,FULL,lemlist_Invoice_Sep.pdf,,
+brief_baseline,must_pass,txn,T3,2026-09-12,-180.00,LOXO,,,,FULL,Loxo_Invoice_Sep.pdf,,
+brief_baseline,must_pass,txn,T4,2026-09-15,14000.00,CLIENT B BV,,,,REVIEW,INV-043_ClientB.pdf,EXACT,Undated invoice so goes to review
+brief_baseline,must_pass,txn,T5,2026-09-22,-45.99,AMZN MKTP,,,,MISSING,,,No Amazon receipt
+brief_baseline,must_pass,txn,T6,2026-09-30,4750.00,CLIENT A,,,,REVIEW,INV-041_ClientA.pdf,PARTIAL,Half of INV-041
+brief_baseline,must_pass,txn,T7,2026-10-01,-180.00,LOXO,,,,MISSING,,,Sep invoice must not be reused for Oct
+brief_baseline,must_pass,txn,T8,2026-10-03,6250.00,CLIENT C,,,,REVIEW,INV-044_ClientC.pdf|CN-002_ClientC.pdf,NETTED,Invoice minus credit note
+brief_baseline,must_pass,doc,Anthropic_Receipt_2026-09-03.pdf,2026-09-03,90.00,Anthropic,receipt,out,,,,,
+brief_baseline,must_pass,doc,lemlist_Invoice_Sep.pdf,2026-09,99.00,lemlist,invoice,out,,,,,Month-only date
+brief_baseline,must_pass,doc,Loxo_Invoice_Sep.pdf,2026-09,180.00,Loxo,invoice,out,,,,,
+brief_baseline,must_pass,doc,INV-041_ClientA.pdf,,9500.00,Client A,invoice,in,,,,,
+brief_baseline,must_pass,doc,INV-043_ClientB.pdf,,14000.00,Client B,invoice,in,,,,,
+brief_baseline,must_pass,doc,INV-044_ClientC.pdf,,7500.00,Client C,invoice,in,,,,,
+brief_baseline,must_pass,doc,CN-002_ClientC.pdf,,-1250.00,Client C,credit_note,in,,,,,
+loxo_messy_bank_text,known_bug,txn,T3,2026-09-12,-180.00,LOXO INC 8834 NY,,,,FULL,Loxo_Invoice_Sep.pdf,,Real bank text carries extra tokens
+loxo_messy_bank_text,known_bug,txn,T7,2026-10-01,-180.00,LOXO,,,,MISSING,,,Must not grab the Sep invoice
+loxo_messy_bank_text,known_bug,doc,Loxo_Invoice_Sep.pdf,2026-09,180.00,Loxo,invoice,out,,,,,
+fx_difference,known_bug,txn,T1,2026-09-03,-89.73,ANTHROPIC,,,,REVIEW,Anthropic_Receipt_2026-09-03.pdf,EXACT,USD billing: small FX gap is not a partial payment
+fx_difference,known_bug,doc,Anthropic_Receipt_2026-09-03.pdf,2026-09-03,90.00,Anthropic,receipt,out,,,,,
+late_paying_client,known_bug,txn,T6,2026-09-30,4750.00,CLIENT A,,,,REVIEW,INV-041_ClientA.pdf,PARTIAL,Clients often pay 60+ days late
+late_paying_client,known_bug,doc,INV-041_ClientA.pdf,2026-08-01,9500.00,Client A,invoice,in,,,,,
+second_partial_payment,known_bug,txn,T6,2026-09-30,4750.00,CLIENT A,,,,REVIEW,INV-041_ClientA.pdf,PARTIAL,First half
+second_partial_payment,known_bug,txn,T9,2026-10-20,4750.00,CLIENT A,,,,REVIEW,INV-041_ClientA.pdf,PARTIAL,Second half should settle the same invoice
+second_partial_payment,known_bug,doc,INV-041_ClientA.pdf,2026-09-01,9500.00,Client A,invoice,in,,,,,
+vat_rule,must_pass,doc,Loxo_Invoice_Sep.pdf,2026-09,180.00,Loxo,invoice,out,0,VAT_FLAG,,,Over 100 and no VAT shown
+vat_rule,must_pass,doc,lemlist_Invoice_Sep.pdf,2026-09,99.00,lemlist,invoice,out,0,NO_FLAG,,,Under 100
+vat_rule,must_pass,doc,Shop_Receipt.pdf,2026-09-10,100.00,Shop,receipt,out,0,NO_FLAG,,,Exactly 100 is not over
+vat_rule,must_pass,doc,Figma_Invoice_Sep.pdf,2026-09-01,121.00,Figma,invoice,out,21.00,NO_FLAG,,,VAT shown
+vat_rule,must_pass,doc,INV-041_ClientA.pdf,2026-09-01,9500.00,Client A,invoice,in,0,NO_FLAG,,,"Client invoices are income, never flagged"
+vat_rule,must_pass,doc,Unread_Invoice.pdf,2026-09-01,500.00,Acme,invoice,out,,NO_FLAG,,,VAT never read: not judged

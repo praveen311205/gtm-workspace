@@ -1,0 +1,16 @@
+# Secrets - never share or commit
+credentials.json
+token.json
+
+# Real financial documents and generated output
+documents/
+out/
+forward_*.txt
+forward_*.eml
+weekly_report_*.txt
+ledger.json
+
+# Python / test artefacts
+__pycache__/
+*.pyc
+tests/_tmp/
