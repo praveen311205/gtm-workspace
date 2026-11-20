@@ -41,7 +41,7 @@ const day = (s) => new Date(fromWall(...s.split('-').map(Number), 0, 0, AMS));  
 // ---------------------------------------------------------------- fakes
 
 function makeEnv({ rows, lead = 30, now, props = {}, calendar = null, tab = true, lockFree = true,
-                   writeLimit = Infinity, triggers = [] }) {
+                   writeLimit = Infinity, triggers = [], triggerError = '', mailError = '', calendarError = '' }) {
   let NOW = new Date(now).getTime();
   const RealDate = Date;
   class FakeDate extends RealDate {
@@ -50,6 +50,7 @@ function makeEnv({ rows, lead = 30, now, props = {}, calendar = null, tab = true
   }
   const mails = [];
   const logs = [];
+  const errors = [];
   const store = Object.assign({}, props);
   const cal = calendar || { events: [], created: 0 };
   let nextId = cal.events.length + 1;
@@ -80,7 +81,7 @@ function makeEnv({ rows, lead = 30, now, props = {}, calendar = null, tab = true
   };
   const sheetRows = rows;
   const env = {
-    console: { log: (m) => logs.push(m), warn() {}, error() {} },
+    console: { log: (m) => logs.push(m), warn() {}, error: (m) => errors.push(m) },
     Date: FakeDate,
     Session: { getEffectiveUser: () => ({ getEmail: () => 'praveen@gtmtalent.tech' }) },
     LockService: { getScriptLock: () => ({ tryLock: () => lockFree, releaseLock() {} }) },
@@ -93,16 +94,17 @@ function makeEnv({ rows, lead = 30, now, props = {}, calendar = null, tab = true
       getLastRow: () => sheetRows.length + 1,
     } : null) }) },
     CalendarApp: {
-      getCalendarsByName: () => (cal.exists ? [calendarApi] : []),
+      getCalendarsByName: () => { if (calendarError) throw new Error(calendarError); return cal.exists ? [calendarApi] : []; },
       createCalendar: () => { cal.exists = true; cal.created++; return calendarApi; },
     },
-    MailApp: { sendEmail: (m) => mails.push(m) },
+    MailApp: { sendEmail: (m) => { if (mailError) throw new Error(mailError); mails.push(m); } },
     ScriptApp: {
       getProjectTriggers: () => triggers.slice(),
       deleteTrigger: (t) => triggers.splice(triggers.indexOf(t), 1),
       newTrigger: (handler) => {
         const t = { handler, getHandlerFunction: () => handler };
-        const done = { create() { triggers.push(t); return t; } };
+        const done = { create() { if (triggerError && handler === 'dailyRun') throw new Error(triggerError);
+                                  triggers.push(t); return t; } };
         return { timeBased: () => ({
           after: (ms) => { t.afterMs = ms; return done; },
           everyDays: () => ({ atHour: () => ({ inTimezone: () => done }) }) }) };
@@ -124,7 +126,7 @@ function makeEnv({ rows, lead = 30, now, props = {}, calendar = null, tab = true
   env.module = { exports: {} };
   vm.createContext(env);
   vm.runInContext(fs.readFileSync(SCRIPT, 'utf8'), env);
-  return { api: env.module.exports, mails, store, cal, triggers, logs,
+  return { api: env.module.exports, mails, store, cal, triggers, logs, errors,
            setNow: (t) => { NOW = new Date(t).getTime(); }, resetWrites: () => { writes = 0; writeLimit = Infinity; } };
 }
 
@@ -292,6 +294,32 @@ console.log("Google's calendar rate limit (the error seen on the first real run)
   check(other.triggers.some(t => t.handler === 'continueSync' && t.afterMs === 60 * 1000),
         'time limit: continues after 1 minute');
   other.api.CONFIG.MAX_RUN_MS = realLimit;
+}
+
+console.log("Google's \"unknown error\" (second real run)");
+{
+  // Trigger creation fails: setup still sends the email and builds the calendar.
+  const c4 = { events: [], created: 0 };
+  const env4 = makeEnv({ rows: ROWS, now: NOW, calendar: c4, triggerError: 'An unknown error has occurred, please try again later.' });
+  env4.api.setup();
+  check(env4.mails.length === 1 && live(c4).length === 8, 'trigger creation fails: email sent and calendar built anyway');
+  check(env4.errors.some(m => /Daily trigger not installed \(An unknown error/.test(m)), 'log names the failed step');
+  check(env4.logs.some(m => /^2\/4 Installing the daily trigger/.test(m)), 'steps are logged in order');
+
+  // Email fails: calendar still synced, error logged, run marked failed.
+  const c5 = { events: [], created: 0 };
+  const env5 = makeEnv({ rows: ROWS, now: NOW, calendar: c5, mailError: 'An unknown error has occurred, please try again later.' });
+  let thrown = '';
+  try { env5.api.dailyRun(); } catch (err) { thrown = err.message; }
+  check(live(c5).length === 8, 'email fails: calendar still synced');
+  check(/Reminder email failed: An unknown error/.test(thrown), 'run reports the email failure (Google sends a failure notice)');
+  check(!/Pin/.test(env5.store.sent || ''), 'charges not marked as emailed, so the next run retries them');
+
+  // Calendar throws an unknown error: email still sent, continuation scheduled.
+  const env6 = makeEnv({ rows: ROWS, now: NOW, calendarError: 'An unknown error has occurred, please try again later.' });
+  env6.api.dailyRun();
+  check(env6.mails.length === 1 && env6.triggers.some(t => t.handler === 'continueSync'),
+        'calendar unknown error: email sent, continuation scheduled');
 }
 
 console.log(`\nAll ${passed} checks passed.`);

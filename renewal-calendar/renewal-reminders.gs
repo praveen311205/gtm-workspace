@@ -1,6 +1,6 @@
 /**
  * GTM Talent - Renewal reminders (Google Apps Script, bound to the
- * "GTM Talent - Software Inventory" sheet)                       version 0.2.0
+ * "GTM Talent - Software Inventory" sheet)                       version 0.2.1
  *
  * Every morning it reads the "Charge calendar" tab (every expected bank charge
  * for the next 12 months, built by formulas from the Inventory tab) and:
@@ -45,12 +45,18 @@ const COL = { DATE: 1, REMINDER: 3, TOOL: 4, AMOUNT: 5, STATUS: 6, METHOD: 7 };
 
 /** Run once by hand: checks the tab, creates the daily trigger, runs once. */
 function setup() {
+  console.log('1/4 Reading the Charge calendar tab');
   readCharges_();                                   // fails early if the tab is missing
-  ScriptApp.getProjectTriggers()
-    .filter(t => t.getHandlerFunction() === 'dailyRun')
-    .forEach(t => ScriptApp.deleteTrigger(t));
-  ScriptApp.newTrigger('dailyRun').timeBased().everyDays(1)
-    .atHour(CONFIG.RUN_HOUR).inTimezone(CONFIG.TIMEZONE).create();
+  console.log('2/4 Installing the daily trigger');
+  try {
+    removeTriggers_('dailyRun');
+    ScriptApp.newTrigger('dailyRun').timeBased().everyDays(1)
+      .atHour(CONFIG.RUN_HOUR).inTimezone(CONFIG.TIMEZONE).create();
+  } catch (e) {
+    // Do not stop here: the reminders can still go out. Retry setup later.
+    console.error(`Daily trigger not installed (${errorText_(e)}). Run setup again later; ` +
+                  'until then, run dailyRun by hand.');
+  }
   dailyRun();
 }
 
@@ -61,16 +67,38 @@ function dailyRun() {
   try {
     const { charges, lead } = readCharges_();
     const today = dayKey_(new Date());
-    const sent = sendReminders_(charges, lead, today);      // email first: never blocked by the calendar
-    const result = syncCalendar_(charges, today);
+    console.log(`3/4 Reminder email (${charges.length} charges in the sheet, lead ${lead} days)`);
+    let sent = 'failed';
+    let failure = null;
+    try {
+      sent = sendReminders_(charges, lead, today);          // email first: never blocked by the calendar
+    } catch (e) {
+      failure = `Reminder email failed: ${errorText_(e)}`;
+      console.error(failure);
+    }
+    console.log('4/4 Calendar "' + CONFIG.CALENDAR_NAME + '"');
+    let result = { created: 0, updated: 0, deleted: 0, stopped: '' };
+    try {
+      result = syncCalendar_(charges, today);
+    } catch (e) {
+      // Google's unexplained "unknown error" is usually temporary: continue later.
+      result.stopped = `calendar error: ${errorText_(e)}`;
+      failure = failure || `Calendar failed: ${errorText_(e)}`;
+    }
     let note = '';
     if (result.stopped) {
       const minutes = result.stopped === 'run time limit' ? 1 : CONFIG.RETRY_MINUTES;
-      scheduleContinuation_(minutes);
-      note = ` Calendar not finished (${result.stopped}); continuing in ${minutes} minute(s).`;
+      try {
+        scheduleContinuation_(minutes);
+        note = ` Calendar not finished (${result.stopped}); continuing in ${minutes} minute(s).`;
+      } catch (e) {
+        note = ` Calendar not finished (${result.stopped}); could not schedule the continuation ` +
+               `(${errorText_(e)}): tomorrow's run continues.`;
+      }
     }
     console.log(`Reminder email: ${sent} charge(s). Calendar: ${result.created} created, ` +
                 `${result.updated} updated, ${result.deleted} removed.${note}`);
+    if (failure && sent === 'failed') throw new Error(failure);   // so Google emails a failure notice
   } finally {
     lock.releaseLock();
   }
@@ -138,6 +166,10 @@ function getCalendar_() {
   const found = CalendarApp.getCalendarsByName(CONFIG.CALENDAR_NAME);
   return found.length ? found[0]
     : CalendarApp.createCalendar(CONFIG.CALENDAR_NAME, { timeZone: CONFIG.TIMEZONE });
+}
+
+function errorText_(e) {
+  return String(e && e.message ? e.message : e);
 }
 
 function isRateLimit_(e) {

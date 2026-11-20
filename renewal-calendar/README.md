@@ -96,7 +96,7 @@ only a handful of events change per run.
 node renewal-calendar/tests/reminders.test.js
 ```
 
-46 checks against fake Calendar, Mail and Sheets services: first run and
+53 checks against fake Calendar, Mail and Sheets services: first run and
 catch-up email, idempotent re-runs, newly due charges, amount and date changes,
 removed tools, lead-time changes, missed days, summer and winter time,
 Google's rate limit with automatic continuation, and error cases.
