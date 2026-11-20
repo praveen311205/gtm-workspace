@@ -40,7 +40,8 @@ const day = (s) => new Date(fromWall(...s.split('-').map(Number), 0, 0, AMS));  
 
 // ---------------------------------------------------------------- fakes
 
-function makeEnv({ rows, lead = 30, now, props = {}, calendar = null, tab = true, lockFree = true }) {
+function makeEnv({ rows, lead = 30, now, props = {}, calendar = null, tab = true, lockFree = true,
+                   writeLimit = Infinity, triggers = [] }) {
   let NOW = new Date(now).getTime();
   const RealDate = Date;
   class FakeDate extends RealDate {
@@ -48,29 +49,38 @@ function makeEnv({ rows, lead = 30, now, props = {}, calendar = null, tab = true
     static now() { return NOW; }
   }
   const mails = [];
+  const logs = [];
   const store = Object.assign({}, props);
   const cal = calendar || { events: [], created: 0 };
   let nextId = cal.events.length + 1;
+  let writes = 0;
+  const limited = (fn) => (...args) => {     // Google's "too many" after writeLimit writes
+    if (++writes > writeLimit) {
+      throw new Error('You have been creating or deleting too many calendars or calendar events in a short time. Please try again later.');
+    }
+    return fn(...args);
+  };
   const makeEvent = (title, start, end, desc, allDay) => {
     const ev = {
       id: nextId++, title, start, end, desc, allDay, reminders: [], deleted: false,
-      getTitle() { return this.title; }, setTitle(t) { this.title = t; },
-      getDescription() { return this.desc; }, setDescription(d) { this.desc = d; },
-      getStartTime() { return this.start; }, setTime(s, e) { this.start = s; this.end = e; },
-      deleteEvent() { this.deleted = true; },
-      removeAllReminders() { this.reminders = []; }, addPopupReminder(m) { this.reminders.push(m); },
+      getTitle() { return this.title; }, setTitle: limited(function (t) { ev.title = t; }),
+      getDescription() { return this.desc; }, setDescription: limited(function (d) { ev.desc = d; }),
+      getStartTime() { return this.start; }, setTime: limited(function (s, e) { ev.start = s; ev.end = e; }),
+      deleteEvent: limited(function () { ev.deleted = true; }),
+      removeAllReminders: limited(function () { ev.reminders = []; }),
+      addPopupReminder: limited(function (m) { ev.reminders.push(m); }),
     };
     cal.events.push(ev);
     return ev;
   };
   const calendarApi = {
     getEvents: (from, until) => cal.events.filter(e => !e.deleted && e.start >= from && e.start < until),
-    createAllDayEvent: (t, d, o) => makeEvent(t, d, new RealDate(d.getTime() + 864e5), o.description, true),
-    createEvent: (t, s, e, o) => makeEvent(t, s, e, o.description, false),
+    createAllDayEvent: limited((t, d, o) => makeEvent(t, d, new RealDate(d.getTime() + 864e5), o.description, true)),
+    createEvent: limited((t, s, e, o) => makeEvent(t, s, e, o.description, false)),
   };
   const sheetRows = rows;
   const env = {
-    console: { log() {}, warn() {}, error() {} },
+    console: { log: (m) => logs.push(m), warn() {}, error() {} },
     Date: FakeDate,
     Session: { getEffectiveUser: () => ({ getEmail: () => 'praveen@gtmtalent.tech' }) },
     LockService: { getScriptLock: () => ({ tryLock: () => lockFree, releaseLock() {} }) },
@@ -87,9 +97,19 @@ function makeEnv({ rows, lead = 30, now, props = {}, calendar = null, tab = true
       createCalendar: () => { cal.exists = true; cal.created++; return calendarApi; },
     },
     MailApp: { sendEmail: (m) => mails.push(m) },
-    ScriptApp: { getProjectTriggers: () => [], deleteTrigger() {},
-      newTrigger: () => ({ timeBased: () => ({ everyDays: () => ({ atHour: () => ({ inTimezone: () => ({ create() {} }) }) }) }) }) },
+    ScriptApp: {
+      getProjectTriggers: () => triggers.slice(),
+      deleteTrigger: (t) => triggers.splice(triggers.indexOf(t), 1),
+      newTrigger: (handler) => {
+        const t = { handler, getHandlerFunction: () => handler };
+        const done = { create() { triggers.push(t); return t; } };
+        return { timeBased: () => ({
+          after: (ms) => { t.afterMs = ms; return done; },
+          everyDays: () => ({ atHour: () => ({ inTimezone: () => done }) }) }) };
+      },
+    },
     Utilities: {
+      sleep: () => {},
       formatDate: (d, tz, fmt) => {
         const w = wall(d, tz); const p = (n) => String(n).padStart(2, '0');
         return fmt === 'yyyy-MM-dd' ? `${w.y}-${p(w.m)}-${p(w.d)}` : `${w.y}-${p(w.m)}-${p(w.d)} ${p(w.H)}:${p(w.M)}`;
@@ -104,7 +124,8 @@ function makeEnv({ rows, lead = 30, now, props = {}, calendar = null, tab = true
   env.module = { exports: {} };
   vm.createContext(env);
   vm.runInContext(fs.readFileSync(SCRIPT, 'utf8'), env);
-  return { api: env.module.exports, mails, store, cal, setNow: (t) => { NOW = new Date(t).getTime(); } };
+  return { api: env.module.exports, mails, store, cal, triggers, logs,
+           setNow: (t) => { NOW = new Date(t).getTime(); }, resetWrites: () => { writes = 0; writeLimit = Infinity; } };
 }
 
 const live = (cal) => cal.events.filter(e => !e.deleted);
@@ -236,6 +257,41 @@ console.log('Missed days, DST, failures');
   const busy = makeEnv({ rows: ROWS, now: NOW, lockFree: false });
   busy.api.dailyRun();
   check(busy.mails.length === 0 && busy.cal.events.length === 0, 'overlapping run does nothing');
+}
+
+console.log("Google's calendar rate limit (the error seen on the first real run)");
+{
+  const c3 = { events: [], created: 0 };
+  const e = makeEnv({ rows: ROWS, now: NOW, calendar: c3, writeLimit: 7 });
+  e.api.setup();
+  check(e.mails.length === 1, 'reminder email still sent: it goes out before the calendar sync');
+  const made = live(c3).length;
+  check(made > 0 && made < 8, `run stopped cleanly part-way (${made} events created) instead of crashing`);
+  const cont = e.triggers.filter(t => t.handler === 'continueSync');
+  check(cont.length === 1 && cont[0].afterMs === 20 * 60 * 1000, 'continuation scheduled 20 minutes later');
+  check(/continuing in 20 minute/.test(e.logs.join(' ')), 'log says it will continue');
+  check(e.triggers.filter(t => t.handler === 'dailyRun').length === 1, 'daily trigger still installed');
+  check(live(c3).filter(x => !x.allDay)[0] === undefined || /Slack/.test(live(c3).find(x => !x.allDay).title),
+        'soonest events are created first');
+
+  e.resetWrites();                         // 20 minutes later Google allows writes again
+  e.setNow('2026-11-20T07:21:00Z');
+  const continuation = e.triggers.find(t => t.handler === 'continueSync');
+  e.api.continueSync();
+  check(live(c3).length === 8, 'continuation finishes the calendar: 6 charges + 2 reminders');
+  const tags = live(c3).map(tag);
+  check(new Set(tags).size === tags.length, 'no duplicate events after the interrupted run');
+  check(!e.triggers.includes(continuation) && !e.triggers.some(t => t.handler === 'continueSync'),
+        'continuation trigger removed once it has run');
+  check(e.mails.length === 1, 'no second email');
+
+  const other = makeEnv({ rows: ROWS, now: NOW, calendar: { events: [], created: 0 } });
+  const realLimit = other.api.CONFIG.MAX_RUN_MS;
+  other.api.CONFIG.MAX_RUN_MS = -1;        // as if the run had used up its time
+  other.api.dailyRun();
+  check(other.triggers.some(t => t.handler === 'continueSync' && t.afterMs === 60 * 1000),
+        'time limit: continues after 1 minute');
+  other.api.CONFIG.MAX_RUN_MS = realLimit;
 }
 
 console.log(`\nAll ${passed} checks passed.`);

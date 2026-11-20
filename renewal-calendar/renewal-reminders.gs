@@ -1,6 +1,6 @@
 /**
  * GTM Talent - Renewal reminders (Google Apps Script, bound to the
- * "GTM Talent - Software Inventory" sheet)                       version 0.1.0
+ * "GTM Talent - Software Inventory" sheet)                       version 0.2.0
  *
  * Every morning it reads the "Charge calendar" tab (every expected bank charge
  * for the next 12 months, built by formulas from the Inventory tab) and:
@@ -12,6 +12,12 @@
  *      per day at most, listing each charge once, with the total to have on
  *      the card. The first run sends one catch-up email for everything
  *      already inside the window.
+ *
+ * Google limits how fast a script may create calendar events. Writes are
+ * paced, and if Google still says "too many", the run stops cleanly and a
+ * one-off continuation runs RETRY_MINUTES later; events already created are
+ * recognised by their tag, so nothing is duplicated. The email is sent before
+ * the calendar is touched, so a calendar problem never blocks a reminder.
  *
  * Nothing in the sheet is changed. Setup: see README.md in this folder.
  */
@@ -25,6 +31,9 @@ const CONFIG = {
   RUN_HOUR: 7,                             // the daily run, before the reminder event
   RECIPIENTS: [],                          // empty = the account that runs the script
   TAG: 'gtm-renewal-key:',                 // marks events this script owns
+  WRITE_PAUSE_MS: 700,                     // pause after each calendar write (Google rate limit)
+  RETRY_MINUTES: 20,                       // continue this long after Google says "too many"
+  MAX_RUN_MS: 4.5 * 60 * 1000,             // Apps Script stops runs at 6 min; continue later instead
 };
 
 // Column positions on the Charge calendar tab (1-based).
@@ -52,13 +61,36 @@ function dailyRun() {
   try {
     const { charges, lead } = readCharges_();
     const today = dayKey_(new Date());
+    const sent = sendReminders_(charges, lead, today);      // email first: never blocked by the calendar
     const result = syncCalendar_(charges, today);
-    const sent = sendReminders_(charges, lead, today);
-    console.log(`Calendar: ${result.created} created, ${result.updated} updated, ` +
-                `${result.deleted} removed. Reminder email: ${sent} charge(s).`);
+    let note = '';
+    if (result.stopped) {
+      const minutes = result.stopped === 'run time limit' ? 1 : CONFIG.RETRY_MINUTES;
+      scheduleContinuation_(minutes);
+      note = ` Calendar not finished (${result.stopped}); continuing in ${minutes} minute(s).`;
+    }
+    console.log(`Reminder email: ${sent} charge(s). Calendar: ${result.created} created, ` +
+                `${result.updated} updated, ${result.deleted} removed.${note}`);
   } finally {
     lock.releaseLock();
   }
+}
+
+/** One-off follow-up run after Google's calendar rate limit or the time limit. */
+function continueSync() {
+  removeTriggers_('continueSync');
+  dailyRun();
+}
+
+function scheduleContinuation_(minutes) {
+  removeTriggers_('continueSync');
+  ScriptApp.newTrigger('continueSync').timeBased().after(minutes * 60 * 1000).create();
+}
+
+function removeTriggers_(handler) {
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === handler)
+    .forEach(t => ScriptApp.deleteTrigger(t));
 }
 
 // ---------------------------------------------------------------------------
@@ -108,8 +140,33 @@ function getCalendar_() {
     : CalendarApp.createCalendar(CONFIG.CALENDAR_NAME, { timeZone: CONFIG.TIMEZONE });
 }
 
-/** Create, update or remove this script's events so they match the charges from today on. */
+function isRateLimit_(e) {
+  return /too many|rate limit|quota|try again later|limit exceeded/i.test(String(e && e.message || e));
+}
+
+/**
+ * Create, update or remove this script's events so they match the charges from
+ * today on. Stops early, with result.stopped set, on Google's rate limit or
+ * near the run time limit; the next run picks up where this one stopped.
+ */
 function syncCalendar_(charges, today) {
+  const started = Date.now();
+  const result = { created: 0, updated: 0, deleted: 0, stopped: '' };
+  const write = (fn) => {           // every calendar write goes through here
+    const out = fn();
+    Utilities.sleep(CONFIG.WRITE_PAUSE_MS);
+    return out;
+  };
+  try {
+    syncEvents_(charges, today, result, write, started);
+  } catch (e) {
+    if (!isRateLimit_(e)) throw e;
+    result.stopped = 'Google calendar rate limit';
+  }
+  return result;
+}
+
+function syncEvents_(charges, today, result, write, started) {
   const cal = getCalendar_();
   const from = parseDay_(today);
   const until = parseDay_(addDays_(today, 400));
@@ -117,7 +174,7 @@ function syncCalendar_(charges, today) {
   for (const ev of cal.getEvents(from, until)) {
     const id = tagOf_(ev.getDescription());
     if (id) {
-      if (existing[id]) existing[id].deleteEvent();         // stray duplicate
+      if (existing[id]) write(() => existing[id].deleteEvent());   // stray duplicate
       existing[id] = ev;
     }
   }
@@ -127,32 +184,38 @@ function syncCalendar_(charges, today) {
     wanted[`${c.key}|charge`] = { c, kind: 'charge' };
     if (c.reminder >= today) wanted[`${c.key}|reminder`] = { c, kind: 'reminder' };
   }
-  const result = { created: 0, updated: 0, deleted: 0 };
-  for (const id of Object.keys(wanted)) {
+  // Soonest first, so the events that matter now exist even if a run stops early.
+  const ids = Object.keys(wanted).sort((a, b) => {
+    const da = wanted[a].kind === 'reminder' ? wanted[a].c.reminder : wanted[a].c.date;
+    const db = wanted[b].kind === 'reminder' ? wanted[b].c.reminder : wanted[b].c.date;
+    return da < db ? -1 : da > db ? 1 : 0;
+  });
+  for (const id of ids) {
+    if (Date.now() - started > CONFIG.MAX_RUN_MS) { result.stopped = 'run time limit'; return; }
     const { c, kind } = wanted[id];
     const spec = eventSpec_(c, kind, id);
     const ev = existing[id];
     if (!ev) {
-      const created = kind === 'charge'
+      const created = write(() => (kind === 'charge'
         ? cal.createAllDayEvent(spec.title, parseDay_(c.date), { description: spec.description })
-        : cal.createEvent(spec.title, spec.start, spec.end, { description: spec.description });
-      created.removeAllReminders();
-      if (kind === 'reminder') created.addPopupReminder(0);
+        : cal.createEvent(spec.title, spec.start, spec.end, { description: spec.description })));
       result.created++;
+      write(() => created.removeAllReminders());
+      if (kind === 'reminder') write(() => created.addPopupReminder(0));
       continue;
     }
     let changed = false;
-    if (ev.getTitle() !== spec.title) { ev.setTitle(spec.title); changed = true; }
-    if (ev.getDescription() !== spec.description) { ev.setDescription(spec.description); changed = true; }
+    if (ev.getTitle() !== spec.title) { write(() => ev.setTitle(spec.title)); changed = true; }
+    if (ev.getDescription() !== spec.description) { write(() => ev.setDescription(spec.description)); changed = true; }
     if (kind === 'reminder' && ev.getStartTime().getTime() !== spec.start.getTime()) {
-      ev.setTime(spec.start, spec.end); changed = true;
+      write(() => ev.setTime(spec.start, spec.end)); changed = true;
     }
     if (changed) result.updated++;
   }
   for (const id of Object.keys(existing)) {
-    if (!wanted[id]) { existing[id].deleteEvent(); result.deleted++; }
+    if (Date.now() - started > CONFIG.MAX_RUN_MS) { result.stopped = 'run time limit'; return; }
+    if (!wanted[id]) { write(() => existing[id].deleteEvent()); result.deleted++; }
   }
-  return result;
 }
 
 function eventSpec_(c, kind, id) {
@@ -300,6 +363,6 @@ function escape_(s) {
 }
 
 if (typeof module !== 'undefined') {   // Node test harness only; ignored by Apps Script
-  module.exports = { CONFIG, parseCharges_, syncCalendar_, sendReminders_, buildEmail_, dailyRun, setup,
+  module.exports = { CONFIG, parseCharges_, syncCalendar_, sendReminders_, buildEmail_, dailyRun, setup, continueSync,
                      addDays_, daysBetween_, longDate_, euro_ };
 }

@@ -66,6 +66,19 @@ Settings and sharing → Share with specific people.
   the total due in the whole window. A charge is emailed once. If a day's run
   is missed, the next run includes what was due on the missed days.
 
+## Google's calendar rate limit
+
+Google refuses a burst of event creations ("You have been creating or deleting
+too many calendars or calendar events in a short time"). The first run has
+about 200 events to create (12 months of charges plus reminders), so the
+script paces its calendar writes and, when Google still refuses, stops
+cleanly and schedules a one-off `continueSync` run 20 minutes later (1 minute
+if it only ran out of time). It repeats until the calendar is complete; this
+can take a few rounds on the first day. Events already created are recognised
+by their tag and never duplicated, and the reminder email is sent before the
+calendar is touched, so it never waits on the calendar. After the first day
+only a handful of events change per run.
+
 ## Limits
 
 - Dates come from the inventory: a **projected** renewal date (marked in the
@@ -83,7 +96,7 @@ Settings and sharing → Share with specific people.
 node renewal-calendar/tests/reminders.test.js
 ```
 
-35 checks against fake Calendar, Mail and Sheets services: first run and
+46 checks against fake Calendar, Mail and Sheets services: first run and
 catch-up email, idempotent re-runs, newly due charges, amount and date changes,
-removed tools, lead-time changes, missed days, summer and winter time, and
-error cases.
+removed tools, lead-time changes, missed days, summer and winter time,
+Google's rate limit with automatic continuation, and error cases.
