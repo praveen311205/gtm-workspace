@@ -42,53 +42,62 @@ monthly total, or 0.
 ## Connect Revolut (once, about 15 minutes)
 
 There is no Revolut connector for Claude, so the sheet talks to Revolut's
-Business API itself. Whoever is an admin on Revolut Business does steps 1-3;
-the person whose Google account runs the sync does step 4 onwards (they can be
-the same person, together at one screen).
+Business API itself, with a **read-only API key** from Revolut's API Console.
+Revolut requires every request made with such a key to be signed with a
+signing key; the sheet makes that signing key itself, so nobody needs to
+install anything. The API Console needs a Revolut Business plan of Grow or
+above and the **Manage API** permission (an Owner or Admin has it).
 
-1. **Make a key pair** in Terminal on a Mac:
+Two people, at the same time (on a call or in chat):
 
-   ```bash
-   openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out privatekey.pem
-   ```
+**Praveen (in the sheet):**
 
-   ```bash
-   openssl req -new -x509 -key privatekey.pem -out publiccert.cer -days 1825 -subj "/CN=GTM Talent cash flow"
-   ```
+1. Open the cash flow sheet → Extensions → Apps Script. Add a file (+ →
+   Script) named `revolut-sync` and paste everything in `revolut-sync.gs`.
+   Save. Reload the sheet: a **Revolut** menu appears.
+2. **Revolut → Connect Revolut…** Google asks for permission the first time
+   (this spreadsheet, connect to an external service, send email as you, run
+   on a schedule). If it says "Google hasn't verified this app", click
+   Advanced → Go to the project: it is your own script. Open the menu item
+   again.
+3. Step 1 of the dialog shows a **public key** (it starts with
+   `-----BEGIN PUBLIC KEY-----`). Click **Copy public key** and send it to
+   Nav. It is safe to share; the private half stays in your Google account.
 
-   `privatekey.pem` is a secret: never email it, commit it or paste it in a
-   chat. It goes only into the sheet's Connect dialog (step 5).
-2. **Revolut Business on the web** → Settings → APIs → Business API →
-   **Add API certificate**. Title "Cash flow sheet". OAuth redirect URI:
-   `https://example.com`. Paste the whole contents of `publiccert.cer`.
-   Save, and copy the **Client ID**. If Revolut offers a choice of
-   permissions, choose read only: the sheet never needs more.
-3. Leave that page open: step 6 needs its **Enable access** button.
-4. **Install the script.** Open the cash flow sheet → Extensions → Apps
-   Script (the same project as "Cash flow monthly", if installed). Add a file
-   (+ → Script) named `revolut-sync` and paste everything in
-   `revolut-sync.gs`. Save. Reload the sheet: a **Revolut** menu appears.
-5. **Revolut → Connect Revolut…** Fill in the Client ID, `https://example.com`
-   and the contents of `privatekey.pem`. Google asks for permission the first
-   time (this spreadsheet, connect to an external service, send email as you,
-   run on a schedule).
-6. In Revolut click **Enable access** and approve on your phone. Revolut
-   sends the browser to `https://example.com/?code=oa_prod_...`. The page
-   itself shows nothing; copy that whole address from the address bar, paste
-   it in the dialog's Code field and click **Connect and sync** straight away
-   (the code is only valid for about two minutes).
-7. Done. The first sync reads 13 months of history; then it runs every day at
-   06:00 Amsterdam time. **Revolut → Sync now** runs it on demand.
+**Nav (in Revolut, on any computer):**
 
-Where the secrets live: the Client ID, private key and Revolut tokens are
-stored in the connecting person's private Apps Script user properties. Other
-editors of the sheet cannot read them, and they are not in the sheet or the
-code. **Revolut → Disconnect** deletes them and stops the daily run; removing
-the certificate in Revolut cuts access from that side.
+4. Go to the API Console: developer.revolut.com/console (or Revolut Business
+   → Settings → Integrations → API → **Manage API Console**). Make sure the
+   account switcher at the top right shows the real (Production) GTM Talent
+   account, not Sandbox.
+5. **API keys → New** (Add API key). Permissions, everything else **None**:
+   - Accounts → **Accounts: Read** and **Transactions: Read**
+   - Currency exchange → **Exchange: Read** (optional: only for converting a
+     USD balance at today's rate)
+6. Continue. On the signing step, paste the public key Praveen sent.
+7. Name it `Cash flow sheet`. No expiry date is needed (if you set one, the
+   sync stops on that date and needs a new key). Leave the IP allowlist empty:
+   Google's servers don't have fixed addresses.
+8. **Create API key**, confirm on your phone, and send Praveen the API key it
+   shows. Because it only works together with the signing key in Praveen's
+   Google account, it is useless on its own; still, send it in a direct
+   message and delete the message afterwards.
+
+**Praveen:**
+
+9. Paste the API key in step 2 of the dialog and click **Connect and sync**.
+   The first sync reads 13 months of history (up to a minute). Then it runs
+   every day at 06:00 Amsterdam time; **Revolut → Sync now** runs it on demand.
+
+Where the secrets live: the API key and the signing key are stored in
+Praveen's private Apps Script user properties. Other editors of the sheet
+cannot read them, and they are not in the sheet or the code. **Revolut →
+Disconnect** deletes them and stops the daily run; **Revoke** on the key in the
+API Console cuts access from Revolut's side, immediately.
 
 What it calls: only `GET /accounts`, `GET /transactions` and `GET /rate` on
-`b2b.revolut.com`, plus the sign-in at `/auth/token`. It never makes payments
-or changes anything in Revolut.
+`b2b.revolut.com`. The key has no Write permission, so even a changed script
+could not move money with it.
 
 ### What the sync changes in the model
 
@@ -117,12 +126,12 @@ or changes anything in Revolut.
 
 ### When the sync stops
 
-Revolut can ask for consent again (for example after 90 days, or when the
-certificate is removed). The Bank tab's status (B3) then says so and an
-email goes out; the model keeps the last synced balance until it is fixed.
-Reconnect with a new code: Revolut → Connect Revolut, then Enable access in
-Revolut again (step 6). If Revolut only gives the last 90 days of history, the
-status says that too.
+If the key is revoked, expires or loses its permissions, the Bank tab's status
+(B3) says so and an email goes out; the model keeps the last synced balance.
+Nav makes a new key in the API Console with the same public key (Praveen can
+show it again: Revolut → Connect Revolut, step 1) and Praveen pastes it in
+step 2. "Make a new one" in step 1 replaces the signing key, after which keys
+made with the old public key stop working.
 
 ## Every month (5 minutes)
 
@@ -201,12 +210,14 @@ known invoices, emails without an invoice number, old emails ignored, re-runs
 change nothing, stale bank balance warning, Drive failure, months before the
 forecast starts, and setup with a missing tab.
 
-44 checks for the Revolut sync against a fake Revolut API: the signed sign-in
-token (verified with the public key), connecting with a pasted redirect
-address, PKCS#1 keys refused with a fix, balances in several currencies,
+54 checks for the Revolut sync against a fake Revolut API that verifies every
+request's signature the way Revolut does: Ed25519 signatures and public keys
+identical to Node's own implementation, a signing key made in the dialog or
+taken from an OpenSSL private.pem (other key types refused), connecting and
+disconnecting, a rejected API key not kept, balances in several currencies,
 inactive accounts, one row per leg, internal transfers and exchanges, fees,
 declined payments, categories from rules, inventory names and invoice numbers,
 invoices marked Paid by reference or a unique amount (and left alone when two
-match), month-end balances, re-runs that change nothing, more than 1,000
-transactions, a retried server error, expired access, the 90-day limit, and
-that only GET requests reach the API.
+match), month-end balances, re-runs that change nothing and send no repeat
+emails, more than 1,000 transactions, a retried server error, a revoked key, a
+limit on history, and that only GET requests reach the API.

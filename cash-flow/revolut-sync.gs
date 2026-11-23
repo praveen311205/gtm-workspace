@@ -1,6 +1,6 @@
 /**
  * GTM Talent - Revolut Business sync (Google Apps Script, bound to the
- * "GTM Talent - Cash Flow Model" sheet)                         version 0.1.0
+ * "GTM Talent - Cash Flow Model" sheet)                         version 0.2.0
  *
  * Every morning it reads the Revolut Business API (read-only calls only:
  * accounts, transactions, exchange rate) and:
@@ -14,16 +14,19 @@
  *      number in the payment reference, or by a unique exact amount);
  *   4. fills in the real month-end balance on "Monthly check-ins".
  *
- * It never makes a payment or changes anything in Revolut: it only sends GET
- * requests to /accounts, /transactions and /rate.
+ * Access is a Revolut API key made in Revolut's API Console with read-only
+ * permissions, plus an Ed25519 signing key. The signing key is made here, in
+ * the Connect dialog: only its public half is shown (to paste into the API
+ * Console); the private half never leaves this Google account. The API key and
+ * signing key are kept in this Google account's private user properties for
+ * this script, so other editors of the sheet cannot read them. Setup: README.md.
  *
- * The Revolut key and tokens are kept in this Google account's private user
- * properties for this script, not in the sheet or the code, so other editors
- * of the sheet cannot read them. Setup: see README.md, "Connect Revolut".
+ * It only ever sends GET requests to /accounts, /transactions and /rate.
  */
 
 const RV = {
-  API: 'https://b2b.revolut.com/api/1.0',
+  HOST: 'https://b2b.revolut.com',
+  API_PATH: '/api/1.0',
   TIMEZONE: 'Europe/Amsterdam',
   RUN_HOUR: 6,
   HISTORY_MONTHS: 13,           // first sync: this far back
@@ -49,41 +52,56 @@ function onOpen() {
 }
 
 function showConnectDialog() {
-  const html = HtmlService.createHtmlOutput(CONNECT_HTML).setWidth(520).setHeight(560);
+  const html = HtmlService.createHtmlOutput(CONNECT_HTML).setWidth(560).setHeight(600);
   SpreadsheetApp.getUi().showModalDialog(html, 'Connect Revolut Business');
 }
 
-/** Called from the dialog. Exchanges the one-time code for tokens and saves everything privately. */
-function saveRevolutConnection(form) {
-  const clientId = String(form.clientId || '').trim();
-  const issuer = String(form.issuer || '').trim().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
-  const key = String(form.privateKey || '').trim();
-  let code = String(form.code || '').trim();
-  const m = code.match(/[?&]code=([^&#\s]+)/);
-  if (m) code = decodeURIComponent(m[1]);                 // whole redirect URL pasted
-  if (!clientId || !issuer || !key || !code) throw new Error('Fill in all four fields.');
-  if (!/-----BEGIN PRIVATE KEY-----/.test(key)) {
-    throw new Error('The private key must start with -----BEGIN PRIVATE KEY----- (PKCS#8). ' +
-      'If yours says BEGIN RSA PRIVATE KEY, convert it: openssl pkcs8 -topk8 -nocrypt -in privatecert.pem -out privatekey-pkcs8.pem');
-  }
+/**
+ * Step 1 of the dialog. Makes a new Ed25519 signing key (or keeps the one made
+ * earlier, unless fresh is true) and returns its public half as PEM text.
+ */
+function getSigningPublicKey(fresh) {
   const props = PropertiesService.getUserProperties();
-  props.setProperties({ RV_CLIENT_ID: clientId, RV_ISSUER: issuer, RV_PRIVATE_KEY: key });
-  const tok = tokenRequest_({ grant_type: 'authorization_code', code });
-  if (!tok.refresh_token) throw new Error('Revolut did not return a refresh token. Try again with a new code.');
-  props.setProperty('RV_REFRESH_TOKEN', tok.refresh_token);
-  cacheAccessToken_(tok);
+  let seedB64 = props.getProperty('RV_SIGNING_SEED');
+  if (!seedB64 || fresh) {
+    seedB64 = bytesToB64_(randomSeed_());
+    props.setProperty('RV_SIGNING_SEED', seedB64);
+  }
+  return publicKeyPem_(ed25519PublicKey_(b64ToBytes_(seedB64)));
+}
+
+/** Optional: use a private.pem made with OpenSSL instead of the one made here. */
+function usePrivateKeyPem(pem) {
+  const seed = seedFromPem_(pem);
+  PropertiesService.getUserProperties().setProperty('RV_SIGNING_SEED', bytesToB64_(seed));
+  return publicKeyPem_(ed25519PublicKey_(seed));
+}
+
+/** Step 2 of the dialog: saves the API key, checks it, installs the daily run and syncs. */
+function saveRevolutConnection(form) {
+  const key = String(form.apiKey || '').trim().replace(/^Bearer\s+/i, '');
+  if (!key) throw new Error('Paste the API key from Revolut\'s API Console.');
+  const props = PropertiesService.getUserProperties();
+  if (!props.getProperty('RV_SIGNING_SEED')) throw new Error('Make the signing key first (step 1).');
+  const previous = props.getProperty('RV_API_KEY');
+  props.setProperty('RV_API_KEY', key);
+  try {
+    apiGet_('/accounts');
+  } catch (e) {
+    if (previous) props.setProperty('RV_API_KEY', previous); else props.deleteProperty('RV_API_KEY');
+    throw new Error(`Revolut did not accept it: ${e.message}. Check that the API Console key has the public ` +
+      'signing key from step 1 and Accounts read access.');
+  }
   installTrigger_();
-  const result = syncRevolut();
-  return `Connected. ${result}`;
+  return `Connected. ${syncRevolut()}`;
 }
 
 function disconnectRevolut() {
   const props = PropertiesService.getUserProperties();
-  ['RV_CLIENT_ID', 'RV_ISSUER', 'RV_PRIVATE_KEY', 'RV_REFRESH_TOKEN'].forEach(k => props.deleteProperty(k));
-  CacheService.getUserCache().remove('RV_ACCESS_TOKEN');
+  ['RV_API_KEY', 'RV_SIGNING_SEED', 'RV_LAST_SYNC', 'RV_NOTIFIED'].forEach(k => props.deleteProperty(k));
   ScriptApp.getProjectTriggers().filter(t => t.getHandlerFunction() === 'syncRevolut')
     .forEach(t => ScriptApp.deleteTrigger(t));
-  setStatus_('Disconnected. The sheet keeps the last synced figures; Inputs falls back to the typed balance.', false);
+  setStatus_('Disconnected. The sheet keeps the last synced figures. Revoke the key in Revolut\'s API Console too.', false);
 }
 
 function installTrigger_() {
@@ -94,79 +112,134 @@ function installTrigger_() {
 }
 
 // ---------------------------------------------------------------------------
-// Auth
+// Requests
 // ---------------------------------------------------------------------------
 
-function base64url_(bytesOrString) {
-  return Utilities.base64EncodeWebSafe(bytesOrString).replace(/=+$/, '');
-}
-
-/** Client assertion JWT that Revolut asks for, signed with the private key (RS256). */
-function clientAssertion_(nowSec) {
-  const p = PropertiesService.getUserProperties();
-  const header = base64url_(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
-  const payload = base64url_(JSON.stringify({
-    iss: p.getProperty('RV_ISSUER'), sub: p.getProperty('RV_CLIENT_ID'),
-    aud: 'https://revolut.com', exp: nowSec + 300,
-  }));
-  const sig = Utilities.computeRsaSha256Signature(`${header}.${payload}`, p.getProperty('RV_PRIVATE_KEY'));
-  return `${header}.${payload}.${base64url_(sig)}`;
-}
-
-function tokenRequest_(grant) {
-  const p = PropertiesService.getUserProperties();
-  const res = UrlFetchApp.fetch(`${RV.API}/auth/token`, {
-    method: 'post', muteHttpExceptions: true,
-    payload: Object.assign({
-      client_id: p.getProperty('RV_CLIENT_ID'),
-      client_assertion_type: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer',
-      client_assertion: clientAssertion_(Math.floor(Date.now() / 1000)),
-    }, grant),
-  });
-  const code = res.getResponseCode();
-  const body = res.getContentText();
-  if (code !== 200) {
-    const err = new Error(`Revolut refused the sign-in (${code}): ${body.slice(0, 300)}`);
-    err.auth = true;
-    throw err;
-  }
-  return JSON.parse(body);
-}
-
-function cacheAccessToken_(tok) {
-  const ttl = Math.max(60, Math.min(21600, Number(tok.expires_in || 2400) - 120));
-  CacheService.getUserCache().put('RV_ACCESS_TOKEN', tok.access_token, ttl);
-}
-
-function accessToken_() {
-  const cached = CacheService.getUserCache().get('RV_ACCESS_TOKEN');
-  if (cached) return cached;
-  const p = PropertiesService.getUserProperties();
-  const refresh = p.getProperty('RV_REFRESH_TOKEN');
-  if (!refresh) { const e = new Error('Revolut is not connected. Use the Revolut menu, Connect Revolut.'); e.auth = true; throw e; }
-  const tok = tokenRequest_({ grant_type: 'refresh_token', refresh_token: refresh });
-  if (tok.refresh_token) p.setProperty('RV_REFRESH_TOKEN', tok.refresh_token);
-  cacheAccessToken_(tok);
-  return tok.access_token;
-}
-
-/** GET only. Retries once on a 401 (stale token) and on 429/5xx. */
+/**
+ * GET only. Signs each request as Revolut's API Console asks: Ed25519 over
+ * timestamp + "GET" + path from /api + query string (as sent) + body (none).
+ * Retries on 429/5xx.
+ */
 function apiGet_(path, query) {
-  const qs = query ? '?' + Object.keys(query).filter(k => query[k] !== undefined && query[k] !== '')
+  const props = PropertiesService.getUserProperties();
+  const key = props.getProperty('RV_API_KEY');
+  const seedB64 = props.getProperty('RV_SIGNING_SEED');
+  if (!key || !seedB64) { const e = new Error('Revolut is not connected. Use the Revolut menu, Connect Revolut.'); e.auth = true; throw e; }
+  const seed = b64ToBytes_(seedB64);
+  const qs = query ? Object.keys(query).filter(k => query[k] !== undefined && query[k] !== '')
     .map(k => `${k}=${encodeURIComponent(query[k])}`).join('&') : '';
+  const fullPath = RV.API_PATH + path;
   for (let attempt = 0; attempt < 3; attempt++) {
-    const res = UrlFetchApp.fetch(`${RV.API}${path}${qs}`, {
-      method: 'get', muteHttpExceptions: true, headers: { Authorization: `Bearer ${accessToken_()}` },
+    const ts = String(Date.now());
+    const sig = bytesToB64_(ed25519Sign_(seed, utf8_(ts + 'GET' + fullPath + qs)));
+    const res = UrlFetchApp.fetch(`${RV.HOST}${fullPath}${qs ? '?' + qs : ''}`, {
+      method: 'get', muteHttpExceptions: true,
+      headers: { Authorization: `Bearer ${key}`, 'Revolut-Api-Timestamp': ts, 'Revolut-Api-Signature': sig },
     });
     const code = res.getResponseCode();
     if (code === 200) return JSON.parse(res.getContentText());
-    if (code === 401 && attempt === 0) { CacheService.getUserCache().remove('RV_ACCESS_TOKEN'); continue; }
     if ((code === 429 || code >= 500) && attempt < 2) { Utilities.sleep(2000 * (attempt + 1)); continue; }
     const err = new Error(`Revolut ${path} answered ${code}: ${res.getContentText().slice(0, 300)}`);
     err.status = code;
-    err.auth = code === 401 || code === 403;
+    err.auth = code === 401;
     throw err;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Ed25519 (RFC 8032), for signing requests. Apps Script has no Ed25519, so it
+// is done here with BigInt; SHA-512 comes from Utilities.computeDigest.
+// ---------------------------------------------------------------------------
+
+const ED = (() => {
+  const p = 2n ** 255n - 19n;
+  const L = 2n ** 252n + 27742317777372353535851937790883648493n;
+  const mod = (a, m = p) => { const r = a % m; return r >= 0n ? r : r + m; };
+  const pow = (b, e) => { let r = 1n; b = mod(b); while (e > 0n) { if (e & 1n) r = mod(r * b); b = mod(b * b); e >>= 1n; } return r; };
+  const inv = a => pow(a, p - 2n);
+  const d = mod(-121665n * inv(121666n));
+  const G = [15112221349535400772501151409588531511454012693041857206046113283949847762202n,
+             46316835694926478169428394003475163141307993866256225615783033603165251855960n, 1n, 0n];
+  G[3] = mod(G[0] * G[1]);
+  return { p, L, mod, inv, d, G };
+})();
+
+function edAdd_(P, Q) {
+  const { mod, d } = ED;
+  const A = mod((P[1] - P[0]) * (Q[1] - Q[0])), B = mod((P[1] + P[0]) * (Q[1] + Q[0]));
+  const C = mod(P[3] * 2n * d * Q[3]), D = mod(P[2] * 2n * Q[2]);
+  const E = B - A, F = D - C, G = D + C, H = B + A;
+  return [mod(E * F), mod(G * H), mod(F * G), mod(E * H)];
+}
+
+function edMul_(n, P) {
+  let R = [0n, 1n, 1n, 0n];
+  let Q = P;
+  while (n > 0n) { if (n & 1n) R = edAdd_(R, Q); Q = edAdd_(Q, Q); n >>= 1n; }
+  return R;
+}
+
+function edEncode_(P) {
+  const { mod, inv } = ED;
+  const zi = inv(P[2]);
+  const x = mod(P[0] * zi), y = mod(P[1] * zi);
+  const out = leBytes_(y, 32);
+  if (x & 1n) out[31] |= 0x80;
+  return out;
+}
+
+function leBytes_(n, len) { const out = []; for (let i = 0; i < len; i++) { out.push(Number(n & 255n)); n >>= 8n; } return out; }
+function leInt_(bytes) { let n = 0n; for (let i = bytes.length - 1; i >= 0; i--) n = (n << 8n) + BigInt(bytes[i]); return n; }
+
+function edExpand_(seed) {
+  const h = sha512_(seed);
+  const a = h.slice(0, 32);
+  a[0] &= 248; a[31] &= 127; a[31] |= 64;
+  return { a: leInt_(a), prefix: h.slice(32) };
+}
+
+function ed25519PublicKey_(seed) { return edEncode_(edMul_(edExpand_(seed).a, ED.G)); }
+
+function ed25519Sign_(seed, msg) {
+  const { a, prefix } = edExpand_(seed);
+  const A = edEncode_(edMul_(a, ED.G));
+  const r = ED.mod(leInt_(sha512_(prefix.concat(msg))), ED.L);
+  const R = edEncode_(edMul_(r, ED.G));
+  const k = ED.mod(leInt_(sha512_(R.concat(A, msg))), ED.L);
+  const S = ED.mod(r + k * a, ED.L);
+  return R.concat(leBytes_(S, 32));
+}
+
+// Byte helpers. Apps Script's Utilities work with signed Java bytes (-128..127).
+function toSigned_(bytes) { return bytes.map(b => (b > 127 ? b - 256 : b)); }
+function toUnsigned_(bytes) { return Array.from(bytes, b => (b < 0 ? b + 256 : b)); }
+function sha512_(bytes) { return toUnsigned_(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_512, toSigned_(bytes))); }
+function utf8_(s) { return toUnsigned_(Utilities.newBlob(s).getBytes()); }
+function bytesToB64_(bytes) { return Utilities.base64Encode(toSigned_(bytes)); }
+function b64ToBytes_(s) { return toUnsigned_(Utilities.base64Decode(s)); }
+
+/** 32 random bytes: four random UUIDs and the time, hashed. */
+function randomSeed_() {
+  const material = [1, 2, 3, 4].map(() => Utilities.getUuid()).join('') + Date.now() + Math.random();
+  return toUnsigned_(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, material));
+}
+
+const SPKI_PREFIX = [0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00];
+const PKCS8_PREFIX = [0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20];
+
+function publicKeyPem_(pub) {
+  const b64 = bytesToB64_(SPKI_PREFIX.concat(pub));
+  return `-----BEGIN PUBLIC KEY-----\n${b64}\n-----END PUBLIC KEY-----`;
+}
+
+function seedFromPem_(pem) {
+  const body = String(pem || '').replace(/-----(BEGIN|END) PRIVATE KEY-----/g, '').replace(/\s+/g, '');
+  const der = body ? b64ToBytes_(body) : [];
+  const ok = der.length === 48 && PKCS8_PREFIX.every((b, i) => der[i] === b);
+  if (!/BEGIN PRIVATE KEY/.test(pem) || !ok) {
+    throw new Error('That is not an Ed25519 private key (private.pem from "openssl genpkey -algorithm ed25519").');
+  }
+  return der.slice(16);
 }
 
 // ---------------------------------------------------------------------------
@@ -190,8 +263,8 @@ function syncRevolut() {
     try {
       fresh = fetchTransactions_(fromDate, now);
     } catch (e) {
-      // Revolut can limit history to the last 90 days without fresh consent.
-      if (e.auth || e.status === 400 || e.status === 403) {
+      // In case Revolut limits how far back transactions can be read.
+      if (e.status === 400 || e.status === 403) {
         fresh = fetchTransactions_(new Date(now.getTime() - 89 * 86400000), now);
         note = ' Revolut only gave the last 90 days of transactions.';
       } else throw e;
@@ -209,14 +282,19 @@ function syncRevolut() {
     const msg = `${accounts.length} accounts, ${rows.length} transactions, ${paid.confirmed.length} invoice(s) marked Paid, ` +
       `${filled} month-end balance(s) filled.${note}`;
     setStatus_(`OK ${fmt_(now, 'd MMM yyyy HH:mm')}: ${msg}`, false);
-    if (paid.confirmed.length || paid.possible.length) notify_('Revolut: invoice payments found', [
+    const seen = JSON.parse(PropertiesService.getUserProperties().getProperty('RV_NOTIFIED') || '{}');
+    const newPossible = paid.possible.filter(l => !seen[l]);
+    newPossible.forEach(l => { seen[l] = 1; });
+    PropertiesService.getUserProperties().setProperty('RV_NOTIFIED', JSON.stringify(seen));
+    if (paid.confirmed.length || newPossible.length) notify_('Revolut: invoice payments found', [
       ...paid.confirmed.map(l => `Marked Paid: ${l}`),
-      ...paid.possible.map(l => `Possible match, not changed: ${l}`),
+      ...newPossible.map(l => `Possible match, not changed: ${l}`),
     ]);
     return msg;
   } catch (e) {
     const text = e.auth
-      ? `Revolut access stopped working: ${e.message}. Reconnect: Revolut menu, Connect Revolut (a new code from Revolut Business, Settings, APIs).`
+      ? `Revolut refused the API key: ${e.message}. It may have expired or been revoked in Revolut's API Console. ` +
+        'Make a new key there (same signing key, read-only permissions) and paste it in Revolut menu, Connect Revolut, step 2.'
       : `Sync failed: ${e.message}`;
     setStatus_(text, true);
     notify_('Revolut sync needs attention', [text, 'Until it is fixed the model keeps the last synced balance.']);
@@ -484,25 +562,40 @@ function rvEuro_(n) {
 }
 
 const CONNECT_HTML = `
-<style>body{font:13px Arial,sans-serif;color:#222}label{display:block;margin:10px 0 4px;font-weight:bold}
-input,textarea{width:100%;box-sizing:border-box;font:12px monospace;padding:6px}textarea{height:110px}
-button{margin-top:14px;padding:8px 14px}#msg{margin-top:10px;white-space:pre-wrap}p{margin:4px 0;color:#555}</style>
-<p>Revolut Business, Settings, APIs, Business API. Steps are in the README.</p>
-<label for="clientId">Client ID</label><input id="clientId">
-<label for="issuer">OAuth redirect URI you entered in Revolut (for example https://example.com)</label><input id="issuer">
-<label for="privateKey">Private key (privatekey.pem, starts with -----BEGIN PRIVATE KEY-----)</label><textarea id="privateKey"></textarea>
-<label for="code">Code: after Enable access, paste the address Revolut sent you to (or just the code)</label><input id="code">
-<button id="go">Connect and sync</button><div id="msg"></div>
+<style>body{font:13px Arial,sans-serif;color:#222}h3{margin:14px 0 6px;font-size:14px}p{margin:4px 0;color:#444}
+textarea,input{width:100%;box-sizing:border-box;font:12px monospace;padding:6px}textarea{height:84px}
+button{margin:8px 8px 0 0;padding:7px 12px}#msg1,#msg2{margin-top:8px;white-space:pre-wrap}details{margin-top:6px;color:#555}</style>
+<h3>Step 1: signing key</h3>
+<p>Copy this public key and give it to whoever creates the API key in Revolut's API Console (it is safe to share).
+The private half stays in your Google account.</p>
+<textarea id="pub" readonly placeholder="Loading…"></textarea>
+<button id="copy">Copy public key</button><button id="fresh">Make a new one</button>
+<details><summary>Use my own private.pem instead</summary>
+<textarea id="pem" placeholder="-----BEGIN PRIVATE KEY-----"></textarea><button id="usepem">Use this key</button></details>
+<div id="msg1"></div>
+<h3>Step 2: API key</h3>
+<p>Paste the API key Revolut's API Console showed after "Create API key".</p>
+<input id="apiKey" autocomplete="off">
+<button id="go">Connect and sync</button><div id="msg2"></div>
 <script>
-document.getElementById('go').onclick = function () {
-  var b = this; b.disabled = true; document.getElementById('msg').textContent = 'Connecting…';
-  google.script.run.withSuccessHandler(function (m) { document.getElementById('msg').textContent = m; b.disabled = false; })
-    .withFailureHandler(function (e) { document.getElementById('msg').textContent = 'Not connected: ' + e.message; b.disabled = false; })
-    .saveRevolutConnection({clientId: clientId.value, issuer: issuer.value, privateKey: privateKey.value, code: code.value});
-};
+function $(id){return document.getElementById(id);}
+function show(pem){$('pub').value=pem;}
+function fail(where){return function(e){$(where).textContent='Not done: '+e.message;};}
+google.script.run.withSuccessHandler(show).withFailureHandler(fail('msg1')).getSigningPublicKey(false);
+$('copy').onclick=function(){$('pub').select();
+  try{navigator.clipboard.writeText($('pub').value).then(function(){$('msg1').textContent='Copied.';},function(){document.execCommand('copy');$('msg1').textContent='Copied.';});}
+  catch(e){document.execCommand('copy');$('msg1').textContent='Copied.';}};
+$('fresh').onclick=function(){$('msg1').textContent='A new key replaces the old one: any API key made with the old public key stops working. Making it…';
+  google.script.run.withSuccessHandler(function(p){show(p);$('msg1').textContent='New key made. Give this public key to Revolut.';}).withFailureHandler(fail('msg1')).getSigningPublicKey(true);};
+$('usepem').onclick=function(){google.script.run.withSuccessHandler(function(p){show(p);$('pem').value='';$('msg1').textContent='Using your key.';}).withFailureHandler(fail('msg1')).usePrivateKeyPem($('pem').value);};
+$('go').onclick=function(){var b=this;b.disabled=true;$('msg2').textContent='Connecting and reading 13 months of transactions…';
+  google.script.run.withSuccessHandler(function(m){$('msg2').textContent=m;$('apiKey').value='';b.disabled=false;})
+    .withFailureHandler(function(e){$('msg2').textContent='Not connected: '+e.message;b.disabled=false;})
+    .saveRevolutConnection({apiKey:$('apiKey').value});};
 </script>`;
 
 if (typeof module !== 'undefined') {   // Node test harness only; ignored by Apps Script
   module.exports = { RV, toRows_, mergeRows_, categorise_, invoiceRef_, softwareKeys_, matchInvoices_,
-    fillCheckIns_, clientAssertion_, fetchTransactions_, syncRevolut, saveRevolutConnection, apiGet_ };
+    fillCheckIns_, fetchTransactions_, syncRevolut, saveRevolutConnection, apiGet_, getSigningPublicKey,
+    usePrivateKeyPem, ed25519Sign_, ed25519PublicKey_, seedFromPem_, disconnectRevolut };
 }

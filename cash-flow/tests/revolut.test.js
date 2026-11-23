@@ -23,13 +23,13 @@ function makeSheet(rows) {
     } };
 }
 
-const { privateKey, publicKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048,
+const { privateKey, publicKey } = crypto.generateKeyPairSync('ed25519', {
   privateKeyEncoding: { type: 'pkcs8', format: 'pem' }, publicKeyEncoding: { type: 'spki', format: 'pem' } });
+const seedOf = pem => crypto.createPrivateKey(pem).export({ format: 'der', type: 'pkcs8' }).slice(16);
 
 function env(opts = {}) {
   const userProps = Object.assign({}, opts.props || {});
-  const cache = {};
-  const sent = [], calls = [];
+  const sent = [], calls = [], sigChecks = [];
   const sheets = {
     Bank: makeSheet([['Last synced', ''], ['Balance', ''], ['Status', ''], ['', ''], [''], ['Account', 'Currency', 'Balance', 'EUR', 'Rate', 'State']]),
     'Bank transactions': makeSheet([[]]),
@@ -75,12 +75,7 @@ function env(opts = {}) {
   const fetch = (url, o) => {
     calls.push({ url, o });
     if (opts.fail && opts.fail(url)) return { getResponseCode: () => opts.failCode || 500, getContentText: () => '{"message":"nope"}' };
-    if (url.endsWith('/auth/token')) {
-      const p = o.payload;
-      if (opts.badRefresh && p.grant_type === 'refresh_token') return { getResponseCode: () => 400, getContentText: () => '{"error":"invalid_grant"}' };
-      return { getResponseCode: () => 200, getContentText: () => JSON.stringify({ access_token: 'acc-' + calls.length, expires_in: 2399,
-        refresh_token: p.grant_type === 'authorization_code' ? 'ref-1' : undefined }) };
-    }
+    sigChecks.push(verifySig(url, o, userProps));
     if (o.method !== 'get') throw new Error('non-GET API call ' + url);
     if (url.includes('/accounts')) return { getResponseCode: () => 200, getContentText: () => JSON.stringify(accounts) };
     if (url.includes('/rate')) return { getResponseCode: () => 200, getContentText: () => JSON.stringify({ rate: 0.91 }) };
@@ -92,11 +87,10 @@ function env(opts = {}) {
     return { getResponseCode: () => 404, getContentText: () => '' };
   };
   const ctx = {
-    console, module: { exports: {} }, JSON, Math, Number, String, Object, Array, Set, Date, encodeURIComponent, decodeURIComponent,
+    console, module: { exports: {} }, JSON, Math, Number, String, Object, Array, Set, Date, BigInt, encodeURIComponent, decodeURIComponent,
     SpreadsheetApp: { getActive: () => ({ getSheetByName: n => sheets[n], getUrl: () => 'https://sheet' }), getUi: () => ({}) },
     PropertiesService: { getUserProperties: () => ({ getProperty: k => userProps[k] ?? null, setProperty: (k, v) => { userProps[k] = v; },
       setProperties: o => Object.assign(userProps, o), deleteProperty: k => { delete userProps[k]; } }) },
-    CacheService: { getUserCache: () => ({ get: k => cache[k] ?? null, put: (k, v) => { cache[k] = v; }, remove: k => { delete cache[k]; } }) },
     UrlFetchApp: { fetch },
     LockService: { getScriptLock: () => ({ tryLock: () => true, releaseLock() {} }) },
     MailApp: { sendEmail: m => sent.push(m) },
@@ -105,26 +99,56 @@ function env(opts = {}) {
     Utilities: {
       formatDate: (d, tz, f) => f === 'yyyy-MM-dd' ? key(d) : d.toISOString(),
       parseDate: s => D(s),
-      base64EncodeWebSafe: x => Buffer.from(typeof x === 'string' ? Buffer.from(x, 'utf8') : Buffer.from(x)).toString('base64').replace(/\+/g, '-').replace(/\//g, '_'),
-      computeRsaSha256Signature: (input, k) => [...crypto.sign('RSA-SHA256', Buffer.from(input), k)],
+      DigestAlgorithm: { SHA_512: 'sha512', SHA_256: 'sha256' },
+      computeDigest: (alg, input) => signed(crypto.createHash(alg).update(typeof input === 'string' ? Buffer.from(input, 'utf8') : Buffer.from(input.map(b => b & 255))).digest()),
+      newBlob: str => ({ getBytes: () => signed(Buffer.from(str, 'utf8')) }),
+      base64Encode: bytes => Buffer.from(bytes.map(b => b & 255)).toString('base64'),
+      base64Decode: str => signed(Buffer.from(str, 'base64')),
+      getUuid: () => crypto.randomUUID(),
       sleep() {},
     },
   };
   vm.createContext(ctx);
   vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'revolut-sync.gs'), 'utf8'), ctx);
-  return { m: ctx.module.exports, sheets, sent, calls, userProps, cache };
+  return { m: ctx.module.exports, sheets, sent, calls, userProps, sigChecks, ctx };
 }
-const connected = { RV_CLIENT_ID: 'cid', RV_ISSUER: 'example.com', RV_PRIVATE_KEY: privateKey, RV_REFRESH_TOKEN: 'ref-0' };
+const signed = buf => Array.from(buf, b => (b > 127 ? b - 256 : b));
+const connected = { RV_API_KEY: 'key-1', RV_SIGNING_SEED: seedOf(privateKey).toString('base64') };
+// Checks a request the way Revolut does: Ed25519 over ts + method + path + query, with the uploaded public key.
+function verifySig(url, o, props) {
+  const u = new URL(url);
+  const ts = o.headers['Revolut-Api-Timestamp'];
+  const msg = ts + 'GET' + u.pathname + (u.search ? u.search.slice(1) : '');
+  const seed = Buffer.from(props.RV_SIGNING_SEED, 'base64');
+  const pub = crypto.createPublicKey(crypto.createPrivateKey({ key: Buffer.concat([Buffer.from('302e020100300506032b657004220420', 'hex'), seed]), format: 'der', type: 'pkcs8' }));
+  return o.headers.Authorization === 'Bearer ' + props.RV_API_KEY &&
+    crypto.verify(null, Buffer.from(msg), pub, Buffer.from(o.headers['Revolut-Api-Signature'], 'base64'));
+}
 
-// JWT
+// Ed25519 matches Node's implementation
 {
   const e = env({ props: connected });
-  const jwt = e.m.clientAssertion_(1700000000);
-  const [h, p, s] = jwt.split('.');
-  const dec = x => JSON.parse(Buffer.from(x.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString());
-  ok(dec(h).alg === 'RS256' && dec(p).iss === 'example.com' && dec(p).sub === 'cid' && dec(p).aud === 'https://revolut.com' && dec(p).exp === 1700000300, 'jwt claims');
-  ok(!/=/.test(jwt), 'jwt unpadded');
-  ok(crypto.verify('RSA-SHA256', Buffer.from(`${h}.${p}`), publicKey, Buffer.from(s.replace(/-/g, '+').replace(/_/g, '/'), 'base64')), 'jwt signature verifies');
+  const seed = [...seedOf(privateKey)];
+  const msg = [...Buffer.from('1783616701644GET/api/1.0/accountsfrom=x')];
+  const ours = Buffer.from(e.m.ed25519Sign_(seed, msg));
+  const nodes = crypto.sign(null, Buffer.from(msg), privateKey);
+  ok(ours.equals(nodes), 'signature identical to Node crypto');
+  const pubDer = crypto.createPublicKey(publicKey).export({ format: 'der', type: 'spki' }).slice(12);
+  ok(Buffer.from(e.m.ed25519PublicKey_(seed)).equals(pubDer), 'public key identical to Node crypto');
+  ok(e.m.usePrivateKeyPem(privateKey).replace(/\s/g, '') === publicKey.replace(/\s/g, ''), 'own private.pem gives the matching public.pem');
+  let err = ''; try { e.m.seedFromPem_('-----BEGIN RSA PRIVATE KEY-----\nMIIB\n-----END RSA PRIVATE KEY-----'); } catch (x) { err = x.message; }
+  ok(/not an Ed25519 private key/.test(err), 'wrong key type refused');
+}
+// key made in the dialog
+{
+  const e = env({ props: {} });
+  const pem = e.m.getSigningPublicKey(false);
+  ok(/^-----BEGIN PUBLIC KEY-----\n[A-Za-z0-9+/=]{60}\n-----END PUBLIC KEY-----$/.test(pem), 'public key PEM shape');
+  const k = crypto.createPublicKey(pem);
+  ok(k.asymmetricKeyType === 'ed25519', 'Node reads it as an Ed25519 public key');
+  ok(e.m.getSigningPublicKey(false) === pem, 'same key on reopening the dialog');
+  ok(e.m.getSigningPublicKey(true) !== pem, 'new key on request');
+  ok(env({ props: {} }).m.getSigningPublicKey(false) !== pem, 'different accounts get different keys');
 }
 // categorise
 {
@@ -175,13 +199,15 @@ const connected = { RV_CLIENT_ID: 'cid', RV_ISSUER: 'example.com', RV_PRIVATE_KE
   ok(Math.abs(C[1][1] - (total - after)) < 0.02, 'October month-end balance ' + C[1][1] + ' vs ' + (total - after));
   ok(C[2][1] === '', 'November not over: left empty');
   ok(C[3][1] === '', 'month before synced history: left empty');
-  ok(e.calls.every(c => c.url.endsWith('/auth/token') || c.o.method === 'get'), 'only GET calls to the API');
+  ok(e.calls.every(c => c.o.method === 'get'), 'only GET calls to the API');
+  ok(e.sigChecks.length === e.calls.length && e.sigChecks.every(Boolean), 'every request carries the API key and a valid signature (' + e.sigChecks.length + ')');
+  ok(e.calls.some(c => /\/transactions\?from=.*&to=.*&count=1000/.test(c.url)), 'transactions query signed as sent');
   ok(e.userProps.RV_LAST_SYNC, 'last sync stored');
   // second sync: idempotent
   e.sent.length = 0;
   e.m.syncRevolut();
   ok(S['Bank transactions'].data.filter(r => r[12]).length === 11, 'no duplicate rows on re-sync');
-  ok(e.sent.length === 1 && !/Marked Paid/.test(e.sent[0].body), 'no repeated Paid on re-sync (only the ambiguous note)');
+  ok(e.sent.length === 0, 'no repeated emails on re-sync');
 }
 // pagination
 {
@@ -194,11 +220,11 @@ const connected = { RV_CLIENT_ID: 'cid', RV_ISSUER: 'example.com', RV_PRIVATE_KE
 }
 // auth failure
 {
-  const e = env({ props: Object.assign({}, connected), badRefresh: true });
+  const e = env({ props: Object.assign({}, connected), failCode: 401, fail: u => true });
   let threw = false;
   try { e.m.syncRevolut(); } catch (x) { threw = true; }
-  ok(threw && /Revolut access stopped working/.test(e.sheets.Bank.data[2][1]), 'auth failure status');
-  ok(e.sent.length === 1 && /Reconnect/.test(e.sent[0].body), 'auth failure emailed');
+  ok(threw && /Revolut refused the API key/.test(e.sheets.Bank.data[2][1]), 'revoked key status');
+  ok(e.sent.length === 1 && /API Console/.test(e.sent[0].body), 'revoked key emailed');
 }
 // API 500 retried then reported
 {
@@ -217,12 +243,18 @@ const connected = { RV_CLIENT_ID: 'cid', RV_ISSUER: 'example.com', RV_PRIVATE_KE
 {
   const e = env({ props: {} });
   let err = '';
-  try { e.m.saveRevolutConnection({ clientId: 'c', issuer: 'https://example.com/', privateKey: '-----BEGIN RSA PRIVATE KEY-----', code: 'x' }); } catch (x) { err = x.message; }
-  ok(/PKCS#8/.test(err), 'PKCS#1 key rejected with conversion hint');
-  const r = e.m.saveRevolutConnection({ clientId: 'cid', issuer: 'https://example.com/', privateKey, code: 'https://example.com/?code=oa_prod_abc&x=1' });
-  ok(e.userProps.RV_ISSUER === 'example.com' && e.userProps.RV_REFRESH_TOKEN === 'ref-1' && /^Connected/.test(r), 'connect saves and syncs');
-  const tokCall = e.calls.find(c => c.url.endsWith('/auth/token'));
-  ok(tokCall.o.payload.code === 'oa_prod_abc' && tokCall.o.payload.client_assertion_type.includes('jwt-bearer'), 'code extracted from URL');
+  try { e.m.saveRevolutConnection({ apiKey: 'k' }); } catch (x) { err = x.message; }
+  ok(/signing key first/.test(err), 'needs the signing key first');
+  e.m.getSigningPublicKey(false);
+  const r = e.m.saveRevolutConnection({ apiKey: 'Bearer key-9 ' });
+  ok(e.userProps.RV_API_KEY === 'key-9' && /^Connected/.test(r), 'connect saves the key (Bearer and spaces trimmed) and syncs');
+  ok(e.sigChecks.every(Boolean), 'requests signed with the key made in the dialog');
+  const bad = env({ props: {}, failCode: 401, fail: u => u.includes('/accounts') });
+  bad.m.getSigningPublicKey(false);
+  err = ''; try { bad.m.saveRevolutConnection({ apiKey: 'wrong' }); } catch (x) { err = x.message; }
+  ok(/did not accept it/.test(err) && !bad.userProps.RV_API_KEY, 'rejected key is not kept');
+  e.m.disconnectRevolut();
+  ok(!e.userProps.RV_API_KEY && !e.userProps.RV_SIGNING_SEED, 'disconnect deletes key and signing key');
 }
 console.log(`${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
