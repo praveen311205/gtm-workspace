@@ -87,7 +87,7 @@ function env(opts = {}) {
     return { getResponseCode: () => 404, getContentText: () => '' };
   };
   const ctx = {
-    console, module: { exports: {} }, JSON, Math, Number, String, Object, Array, Set, Date, BigInt, encodeURIComponent, decodeURIComponent,
+    console, module: { exports: {} }, JSON, Math, Number, String, Object, Array, Set, Date, Float64Array, encodeURIComponent, decodeURIComponent,
     SpreadsheetApp: { getActive: () => ({ getSheetByName: n => sheets[n], getUrl: () => 'https://sheet' }), getUi: () => ({}) },
     PropertiesService: { getUserProperties: () => ({ getProperty: k => userProps[k] ?? null, setProperty: (k, v) => { userProps[k] = v; },
       setProperties: o => Object.assign(userProps, o), deleteProperty: k => { delete userProps[k]; } }) },

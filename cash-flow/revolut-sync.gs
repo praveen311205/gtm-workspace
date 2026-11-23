@@ -1,6 +1,6 @@
 /**
  * GTM Talent - Revolut Business sync (Google Apps Script, bound to the
- * "GTM Talent - Cash Flow Model" sheet)                         version 0.2.0
+ * "GTM Talent - Cash Flow Model" sheet)                         version 0.2.1
  *
  * Every morning it reads the Revolut Business API (read-only calls only:
  * accounts, transactions, exchange rate) and:
@@ -148,66 +148,126 @@ function apiGet_(path, query) {
 
 // ---------------------------------------------------------------------------
 // Ed25519 (RFC 8032), for signing requests. Apps Script has no Ed25519, so it
-// is done here with BigInt; SHA-512 comes from Utilities.computeDigest.
+// is done here with plain numbers, following TweetNaCl (public domain): a
+// field element is 16 limbs of 16 bits. SHA-512 comes from Utilities.
 // ---------------------------------------------------------------------------
 
-const ED = (() => {
-  const p = 2n ** 255n - 19n;
-  const L = 2n ** 252n + 27742317777372353535851937790883648493n;
-  const mod = (a, m = p) => { const r = a % m; return r >= 0n ? r : r + m; };
-  const pow = (b, e) => { let r = 1n; b = mod(b); while (e > 0n) { if (e & 1n) r = mod(r * b); b = mod(b * b); e >>= 1n; } return r; };
-  const inv = a => pow(a, p - 2n);
-  const d = mod(-121665n * inv(121666n));
-  const G = [15112221349535400772501151409588531511454012693041857206046113283949847762202n,
-             46316835694926478169428394003475163141307993866256225615783033603165251855960n, 1n, 0n];
-  G[3] = mod(G[0] * G[1]);
-  return { p, L, mod, inv, d, G };
-})();
+function gf_(init) { const r = new Float64Array(16); if (init) for (let i = 0; i < init.length; i++) r[i] = init[i]; return r; }
+const ED_D2 = gf_([0xf159, 0x26b2, 0x9b94, 0xebd6, 0xb156, 0x8283, 0x149a, 0x00e0, 0xd130, 0xeef3, 0x80f2, 0x198e, 0xfce7, 0x56df, 0xd9dc, 0x2406]);
+const ED_X = gf_([0xd51a, 0x8f25, 0x2d60, 0xc956, 0xa7b2, 0x9525, 0xc760, 0x692c, 0xdc5c, 0xfdd6, 0xe231, 0xc0a4, 0x53fe, 0xcd6e, 0x36d3, 0x2169]);
+const ED_Y = gf_([0x6658, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666]);
+const ED_L = [0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde, 0x14,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10];
 
-function edAdd_(P, Q) {
-  const { mod, d } = ED;
-  const A = mod((P[1] - P[0]) * (Q[1] - Q[0])), B = mod((P[1] + P[0]) * (Q[1] + Q[0]));
-  const C = mod(P[3] * 2n * d * Q[3]), D = mod(P[2] * 2n * Q[2]);
-  const E = B - A, F = D - C, G = D + C, H = B + A;
-  return [mod(E * F), mod(G * H), mod(F * G), mod(E * H)];
+function car_(o) {
+  let c = 1;
+  for (let i = 0; i < 16; i++) { const v = o[i] + c + 65535; c = Math.floor(v / 65536); o[i] = v - c * 65536; }
+  o[0] += c - 1 + 37 * (c - 1);
 }
-
-function edMul_(n, P) {
-  let R = [0n, 1n, 1n, 0n];
-  let Q = P;
-  while (n > 0n) { if (n & 1n) R = edAdd_(R, Q); Q = edAdd_(Q, Q); n >>= 1n; }
-  return R;
+function sel_(p, q, b) {
+  const c = ~(b - 1);
+  for (let i = 0; i < 16; i++) { const t = c & (p[i] ^ q[i]); p[i] ^= t; q[i] ^= t; }
 }
-
-function edEncode_(P) {
-  const { mod, inv } = ED;
-  const zi = inv(P[2]);
-  const x = mod(P[0] * zi), y = mod(P[1] * zi);
-  const out = leBytes_(y, 32);
-  if (x & 1n) out[31] |= 0x80;
-  return out;
+function pack25519_(o, n) {
+  const m = gf_(), t = gf_(n);
+  car_(t); car_(t); car_(t);
+  for (let j = 0; j < 2; j++) {
+    m[0] = t[0] - 0xffed;
+    for (let i = 1; i < 15; i++) { m[i] = t[i] - 0xffff - ((m[i - 1] >> 16) & 1); m[i - 1] &= 0xffff; }
+    m[15] = t[15] - 0x7fff - ((m[14] >> 16) & 1);
+    const b = (m[15] >> 16) & 1;
+    m[14] &= 0xffff;
+    sel_(t, m, 1 - b);
+  }
+  for (let i = 0; i < 16; i++) { o[2 * i] = t[i] & 0xff; o[2 * i + 1] = t[i] >> 8; }
 }
-
-function leBytes_(n, len) { const out = []; for (let i = 0; i < len; i++) { out.push(Number(n & 255n)); n >>= 8n; } return out; }
-function leInt_(bytes) { let n = 0n; for (let i = bytes.length - 1; i >= 0; i--) n = (n << 8n) + BigInt(bytes[i]); return n; }
-
+function fA_(o, a, b) { for (let i = 0; i < 16; i++) o[i] = a[i] + b[i]; }
+function fZ_(o, a, b) { for (let i = 0; i < 16; i++) o[i] = a[i] - b[i]; }
+function fM_(o, a, b) {
+  const t = new Float64Array(31);
+  for (let i = 0; i < 16; i++) for (let j = 0; j < 16; j++) t[i + j] += a[i] * b[j];
+  for (let i = 0; i < 15; i++) t[i] += 38 * t[i + 16];
+  for (let i = 0; i < 16; i++) o[i] = t[i];
+  car_(o); car_(o);
+}
+function inv25519_(o, i) {
+  const c = gf_(i);
+  for (let a = 253; a >= 0; a--) { fM_(c, c, c); if (a !== 2 && a !== 4) fM_(c, c, i); }
+  for (let a = 0; a < 16; a++) o[a] = c[a];
+}
+function edAdd_(p, q) {
+  const a = gf_(), b = gf_(), c = gf_(), d = gf_(), e = gf_(), f = gf_(), g = gf_(), h = gf_(), t = gf_();
+  fZ_(a, p[1], p[0]); fZ_(t, q[1], q[0]); fM_(a, a, t);
+  fA_(b, p[0], p[1]); fA_(t, q[0], q[1]); fM_(b, b, t);
+  fM_(c, p[3], q[3]); fM_(c, c, ED_D2);
+  fM_(d, p[2], q[2]); fA_(d, d, d);
+  fZ_(e, b, a); fZ_(f, d, c); fA_(g, d, c); fA_(h, b, a);
+  fM_(p[0], e, f); fM_(p[1], h, g); fM_(p[2], g, f); fM_(p[3], e, h);
+}
+function edPack_(p) {
+  const tx = gf_(), ty = gf_(), zi = gf_(), r = new Array(32).fill(0), px = new Array(32).fill(0);
+  inv25519_(zi, p[2]); fM_(tx, p[0], zi); fM_(ty, p[1], zi);
+  pack25519_(r, ty); pack25519_(px, tx);
+  r[31] ^= (px[0] & 1) << 7;
+  return r;
+}
+/** s (32 little-endian bytes) times the base point, packed. */
+function edBase_(s) {
+  const p = [gf_(), gf_([1]), gf_([1]), gf_()];
+  const q = [gf_(ED_X), gf_(ED_Y), gf_([1]), gf_()];
+  fM_(q[3], ED_X, ED_Y);
+  for (let i = 255; i >= 0; --i) {
+    const b = (s[(i / 8) | 0] >> (i & 7)) & 1;
+    for (let k = 0; k < 4; k++) sel_(p[k], q[k], b);
+    edAdd_(q, p); edAdd_(p, p);
+    for (let k = 0; k < 4; k++) sel_(p[k], q[k], b);
+  }
+  return edPack_(p);
+}
+function modL_(r, x) {
+  let carry, j;
+  for (let i = 63; i >= 32; --i) {
+    carry = 0;
+    const k = i - 12;
+    for (j = i - 32; j < k; ++j) {
+      x[j] += carry - 16 * x[i] * ED_L[j - (i - 32)];
+      carry = Math.floor((x[j] + 128) / 256);
+      x[j] -= carry * 256;
+    }
+    x[j] += carry;
+    x[i] = 0;
+  }
+  carry = 0;
+  for (j = 0; j < 32; j++) { x[j] += carry - (x[31] >> 4) * ED_L[j]; carry = x[j] >> 8; x[j] &= 255; }
+  for (j = 0; j < 32; j++) x[j] -= carry * ED_L[j];
+  for (let i = 0; i < 32; i++) { x[i + 1] += x[i] >> 8; r[i] = x[i] & 255; }
+}
+/** 64 bytes, read as a little-endian number, reduced mod L to 32 bytes. */
+function reduceL_(h) {
+  const x = new Float64Array(64);
+  for (let i = 0; i < 64; i++) x[i] = h[i];
+  const r = new Array(32).fill(0);
+  modL_(r, x);
+  return r;
+}
 function edExpand_(seed) {
   const h = sha512_(seed);
-  const a = h.slice(0, 32);
-  a[0] &= 248; a[31] &= 127; a[31] |= 64;
-  return { a: leInt_(a), prefix: h.slice(32) };
+  h[0] &= 248; h[31] &= 127; h[31] |= 64;
+  return { a: h.slice(0, 32), prefix: h.slice(32) };
 }
-
-function ed25519PublicKey_(seed) { return edEncode_(edMul_(edExpand_(seed).a, ED.G)); }
-
+function ed25519PublicKey_(seed) { return edBase_(edExpand_(seed).a); }
 function ed25519Sign_(seed, msg) {
   const { a, prefix } = edExpand_(seed);
-  const A = edEncode_(edMul_(a, ED.G));
-  const r = ED.mod(leInt_(sha512_(prefix.concat(msg))), ED.L);
-  const R = edEncode_(edMul_(r, ED.G));
-  const k = ED.mod(leInt_(sha512_(R.concat(A, msg))), ED.L);
-  const S = ED.mod(r + k * a, ED.L);
-  return R.concat(leBytes_(S, 32));
+  const A = edBase_(a);
+  const r = reduceL_(sha512_(prefix.concat(msg)));
+  const R = edBase_(r);
+  const k = reduceL_(sha512_(R.concat(A, msg)));
+  const x = new Float64Array(64);
+  for (let i = 0; i < 32; i++) x[i] = r[i];
+  for (let i = 0; i < 32; i++) for (let j = 0; j < 32; j++) x[i + j] += k[i] * a[j];
+  const S = new Array(32).fill(0);
+  modL_(S, x);
+  return R.concat(S);
 }
 
 // Byte helpers. Apps Script's Utilities work with signed Java bytes (-128..127).
@@ -269,8 +329,11 @@ function syncRevolut() {
         note = ' Revolut only gave the last 90 days of transactions.';
       } else throw e;
     }
-    const accName = Object.fromEntries(accounts.map(a => [a.id, a.name || a.currency]));
-    const rows = mergeRows_(known, fresh.flatMap(t => toRows_(t, accName, rates)));
+    const accName = {};
+    accounts.forEach(a => { accName[a.id] = a.name || a.currency; });
+    const freshRows = [];
+    fresh.forEach(t => { toRows_(t, accName, rates).forEach(r => freshRows.push(r)); });
+    const rows = mergeRows_(known, freshRows);
     const rules = readRules_();
     const softwareNames = readSoftwareNames_();
     rows.forEach(r => { r.category = categorise_(r, rules, softwareNames); r.invoice = invoiceRef_(r); });
