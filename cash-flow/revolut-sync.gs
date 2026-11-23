@@ -1,6 +1,6 @@
 /**
  * GTM Talent - Revolut Business sync (Google Apps Script, bound to the
- * "GTM Talent - Cash Flow Model" sheet)                         version 0.2.1
+ * "GTM Talent - Cash Flow Model" sheet)                         version 0.3.0
  *
  * Every morning it reads the Revolut Business API (read-only calls only:
  * accounts, transactions, exchange rate) and:
@@ -32,6 +32,12 @@ const RV = {
   HISTORY_MONTHS: 13,           // first sync: this far back
   OVERLAP_DAYS: 10,             // later syncs: re-read this many days, to catch late completions
   NOTIFY: [],                   // empty = the account that runs the script
+  // Revolut savings fund that the API does not report as an account balance.
+  // Its moves show as "To Compound" / "From Compound" and daily
+  // "Interest earned - Compound". Its balance is typed once on Inputs
+  // (date in B44, amount in B45) and followed from these moves after that.
+  FUND: 'Compound',
+  FUND_ANCHOR: { DATE: 'B44', AMOUNT: 'B45' },
   TABS: { BANK: 'Bank', TX: 'Bank transactions', RULES: 'Bank rules', PLACEMENTS: 'Placements',
           CHECKINS: 'Monthly check-ins', SOFTWARE: 'Software (from inventory)', INPUTS: 'Inputs' },
 };
@@ -313,7 +319,6 @@ function syncRevolut() {
     const now = new Date();
     const accounts = apiGet_('/accounts').filter(a => a.state !== 'inactive');
     const rates = eurRates_(accounts.map(a => a.currency));
-    writeBank_(accounts, rates, now);
 
     const known = readTransactions_();
     const fromDate = known.length && PropertiesService.getUserProperties().getProperty('RV_LAST_SYNC')
@@ -337,13 +342,17 @@ function syncRevolut() {
     const rules = readRules_();
     const softwareNames = readSoftwareNames_();
     rows.forEach(r => { r.category = categorise_(r, rules, softwareNames); r.invoice = invoiceRef_(r); });
+    markInternal_(rows);
     writeTransactions_(rows);
 
+    const fund = fundBalance_(rows);
+    writeBank_(accounts, rates, now, fund);
     const paid = matchInvoices_(rows);
-    const filled = fillCheckIns_(accounts, rates, rows, now);
+    const filled = fund === null ? 0 : fillCheckIns_(accounts, rates, rows, now, fund);
     PropertiesService.getUserProperties().setProperty('RV_LAST_SYNC', now.toISOString());
     const msg = `${accounts.length} accounts, ${rows.length} transactions, ${paid.confirmed.length} invoice(s) marked Paid, ` +
-      `${filled} month-end balance(s) filled.${note}`;
+      `${filled} month-end balance(s) filled.${note}` +
+      (fund === null ? ` Savings fund (${RV.FUND}) balance not set yet: type it on Inputs ${RV.FUND_ANCHOR.DATE}:${RV.FUND_ANCHOR.AMOUNT}.` : '');
     setStatus_(`OK ${fmt_(now, 'd MMM yyyy HH:mm')}: ${msg}`, false);
     const seen = JSON.parse(PropertiesService.getUserProperties().getProperty('RV_NOTIFIED') || '{}');
     const newPossible = paid.possible.filter(l => !seen[l]);
@@ -524,14 +533,14 @@ function matchInvoices_(rows) {
 // ---------------------------------------------------------------------------
 
 /**
- * Balance at the end of a month = today's balance minus every completed
- * transaction after that month. Fills column B where it is empty and the
- * month is over and inside the synced history.
+ * Balance at the end of a month = accounts today minus every completed account
+ * movement since, plus the savings fund then. Fills column B where it is empty,
+ * the month is over and inside the synced history.
  */
-function fillCheckIns_(accounts, rates, rows, now) {
+function fillCheckIns_(accounts, rates, rows, now, fundNow) {
   const sh = sheet_(RV.TABS.CHECKINS, true);
   if (!sh || sh.getLastRow() < 2) return 0;
-  const total = accounts.reduce((s, a) => s + (Number(a.balance) || 0) * (rates[a.currency] || 0), 0);
+  const total = accountsTotal_(accounts, rates);
   const oldest = rows.length ? rows[rows.length - 1].date : rvDay_(now);
   const vals = sh.getRange(2, 1, sh.getLastRow() - 1, 2).getValues();
   let filled = 0;
@@ -540,12 +549,65 @@ function fillCheckIns_(accounts, rates, rows, now) {
     const monthStart = rvDay_(r[0]).slice(0, 7) + '-01';
     const next = nextMonth_(monthStart);
     if (next > rvDay_(now) || oldest > next) return;    // month not over, or history too short
-    const after = rows.filter(x => x.state === 'completed' && x.date >= next && x.eur !== '')
-      .reduce((s, x) => s + Number(x.eur), 0);
-    sh.getRange(i + 2, 2).setValue(round2_(total - after));
+    let accAfter = 0, fundAfter = 0;
+    rows.forEach(x => {
+      if (x.state !== 'completed' || x.date < next || x.eur === '') return;
+      if (!isFundLeg_(x)) accAfter += Number(x.eur);
+      fundAfter += fundFlow_(x);
+    });
+    sh.getRange(i + 2, 2).setValue(round2_(total - accAfter + fundNow - fundAfter));
     filled++;
   });
   return filled;
+}
+
+// ---------------------------------------------------------------------------
+// Savings fund and transfers between own money
+// ---------------------------------------------------------------------------
+
+function fundRe_(prefix) { return new RegExp('^' + prefix + RV.FUND + '$', 'i'); }
+
+/** Legs that happen inside the fund (withdrawals out of it, interest): not account movements. */
+function isFundLeg_(r) {
+  const d = String(r.description || '').trim();
+  return fundRe_('from ').test(d) || fundRe_('interest earned - ').test(d);
+}
+
+/** How much a leg moves the fund's balance (EUR). */
+function fundFlow_(r) {
+  if (r.state !== 'completed' || r.eur === '') return 0;
+  const d = String(r.description || '').trim();
+  const eur = Number(r.eur) || 0;
+  if (fundRe_('to ').test(d)) return -eur;          // Main -X: fund +X
+  if (fundRe_('from ').test(d)) return eur;         // -X: fund -X
+  if (fundRe_('interest earned - ').test(d)) return eur;
+  return 0;
+}
+
+/** Fund balance now: the typed balance on Inputs plus every move after that day; null if not typed. */
+function fundBalance_(rows) {
+  const inputs = sheet_(RV.TABS.INPUTS, true);
+  if (!inputs) return null;
+  const day = inputs.getRange(RV.FUND_ANCHOR.DATE).getValue();
+  const amount = inputs.getRange(RV.FUND_ANCHOR.AMOUNT).getValue();
+  if (!rvIsDate_(day) || amount === '' || amount === null || isNaN(Number(amount))) return null;
+  const from = rvDay_(day);
+  return rows.filter(r => r.date > from).reduce((s, r) => s + fundFlow_(r), Number(amount));
+}
+
+/** A transaction is internal when any of its legs is (exchange, own account, savings fund). */
+function markInternal_(rows) {
+  const tx = r => String(r.id).split(':')[0];
+  const internal = {};
+  rows.forEach(r => {
+    const d = String(r.description || '').trim();
+    if (r.category === 'Internal transfer' || fundRe_('to ').test(d) || fundRe_('from ').test(d)) internal[tx(r)] = 1;
+  });
+  rows.forEach(r => { if (internal[tx(r)]) r.category = 'Internal transfer'; });
+}
+
+function accountsTotal_(accounts, rates) {
+  return accounts.reduce((s, a) => s + (Number(a.balance) || 0) * (rates[a.currency] || 0), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -558,11 +620,15 @@ function sheet_(name, optional) {
   return sh;
 }
 
-function writeBank_(accounts, rates, now) {
+function writeBank_(accounts, rates, now, fund) {
   const sh = sheet_(RV.TABS.BANK);
-  const total = accounts.reduce((s, a) => s + (Number(a.balance) || 0) * (rates[a.currency] || 0), 0);
+  const total = accountsTotal_(accounts, rates);
   sh.getRange('B1').setValue(now);
-  sh.getRange('B2').setValue(round2_(total));
+  sh.getRange('B2').setValue(round2_(total + (fund || 0)));
+  sh.getRange('H1:I2').setValues([
+    ['Revolut accounts (EUR)', round2_(total)],
+    [`Savings fund (${RV.FUND}), followed from the typed balance on Inputs`, fund === null ? 'Not set' : round2_(fund)],
+  ]);
   const last = Math.max(sh.getLastRow(), 6);
   sh.getRange(7, 1, last - 6 + 20, 6).clearContent();
   const table = accounts.map(a => [a.name || a.currency, a.currency, Number(a.balance) || 0,
@@ -659,6 +725,6 @@ $('go').onclick=function(){var b=this;b.disabled=true;$('msg2').textContent='Con
 
 if (typeof module !== 'undefined') {   // Node test harness only; ignored by Apps Script
   module.exports = { RV, toRows_, mergeRows_, categorise_, invoiceRef_, softwareKeys_, matchInvoices_,
-    fillCheckIns_, fetchTransactions_, syncRevolut, saveRevolutConnection, apiGet_, getSigningPublicKey,
+    fillCheckIns_, fetchTransactions_, fundBalance_, fundFlow_, markInternal_, syncRevolut, saveRevolutConnection, apiGet_, getSigningPublicKey,
     usePrivateKeyPem, ed25519Sign_, ed25519PublicKey_, seedFromPem_, disconnectRevolut };
 }

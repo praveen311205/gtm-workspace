@@ -101,6 +101,15 @@ could not move money with it.
 
 ### What the sync changes in the model
 
+- **Savings fund.** GTM Talent keeps its reserves in Revolut's "Compound"
+  savings fund, whose balance Revolut's API does not report. Type the fund's
+  balance once, from the Revolut app, on Inputs B44 (date) and B45 (amount).
+  The sync then follows it: plus "To Compound" transfers and the daily
+  interest, minus "From Compound" withdrawals. Until B45 is filled the model
+  keeps using the typed balance in B40:B41, because the accounts alone hold
+  almost nothing. Check it against the app now and then; if it drifts, type
+  a fresh balance and date. Moves to and from the fund (both sides) count as
+  Internal transfer, not income or costs.
 - **Cash balance.** Inputs B5 and B6 take the date and total balance (all
   accounts, converted to EUR at Revolut's rate) from the Bank tab, so the
   forecast always starts from this morning's real balance. Set Inputs B39 to

@@ -44,12 +44,14 @@ function env(opts = {}) {
     ]),
     'Monthly check-ins': makeSheet([['Month', 'Actual'], [D('2026-10-01'), ''], [D('2026-11-01'), ''], [D('2025-01-01'), '']]),
     'Software (from inventory)': makeSheet([['Date', 'Row', 'Rem', 'Tool'], ['', '', '', 'Slack'], ['', '', '', 'LinkedIn Recruiter Lite'], ['', '', '', 'Claude (Anthropic)']]),
-    Inputs: makeSheet(Array.from({ length: 35 }, (_, i) => i === 34 ? ['', 1.0992] : [''])),
+    Inputs: makeSheet(Array.from({ length: 45 }, (_, i) => i === 34 ? ['', 1.0992] :
+      i === 43 ? ['', opts.noFund ? '' : D('2026-10-31')] : i === 44 ? ['', opts.noFund ? '' : 100000] : [''])),
   };
   const accounts = opts.accounts || [
     { id: 'a1', name: 'Main', currency: 'EUR', balance: 140000, state: 'active' },
     { id: 'a2', name: 'USD', currency: 'USD', balance: 1100, state: 'active' },
     { id: 'a3', name: 'Old', currency: 'EUR', balance: 0, state: 'inactive' },
+    { id: 'a5', name: 'EUR', currency: 'EUR', balance: 0, state: 'active' },
   ];
   const tx = opts.tx || [
     { id: 't1', type: 'transfer', state: 'completed', created_at: '2026-11-05T09:00:00Z', completed_at: '2026-11-05T09:01:00Z', reference: 'Payment INV-31',
@@ -71,6 +73,15 @@ function env(opts = {}) {
       legs: [{ leg_id: 'l8', account_id: 'a1', amount: 5000, currency: 'EUR', description: 'From Y GmbH', counterparty: { account_type: 'external' } }] },
     { id: 't9', type: 'card_payment', state: 'completed', created_at: '2026-11-16T09:00:00Z', merchant: { name: 'LINKEDIN 123' },
       legs: [{ leg_id: 'l9', account_id: 'a2', amount: -110, fee: 1.5, currency: 'USD', description: 'LinkedIn' }] },
+    { id: 't10', type: 'transfer', state: 'completed', created_at: '2026-11-02T09:00:00Z',
+      legs: [{ leg_id: 'l10', account_id: 'a1', amount: -15000, currency: 'EUR', description: 'To Compound' }] },
+    { id: 't11', type: 'transfer', state: 'completed', created_at: '2026-11-06T09:00:00Z',
+      legs: [{ leg_id: 'l11b', account_id: 'a1', amount: 500, currency: 'EUR', description: '' },
+             { leg_id: 'l11a', account_id: 'a5', amount: -500, currency: 'EUR', description: 'From Compound' }] },
+    { id: 't12', type: 'interest', state: 'completed', created_at: '2026-11-07T09:00:00Z',
+      legs: [{ leg_id: 'l12', account_id: 'a5', amount: 4.5, currency: 'EUR', description: 'Interest earned - Compound' }] },
+    { id: 't13', type: 'transfer', state: 'completed', created_at: '2026-11-08T09:00:00Z',
+      legs: [{ leg_id: 'l13', account_id: 'a1', amount: -7500, currency: 'EUR', description: 'To COMPOUND & GROWTH PARTNERS LTD' }] },
   ];
   const fetch = (url, o) => {
     calls.push({ url, o });
@@ -171,12 +182,18 @@ function verifySig(url, o, props) {
   const e = env({ props: connected });
   const msg = e.m.syncRevolut();
   const S = e.sheets;
-  ok(S.Bank.data[1][1] === Math.round((140000 + 1100 * 0.91) * 100) / 100, 'total EUR balance ' + S.Bank.data[1][1]);
+  const fundNow = 100000 + 15000 - 500 + 4.5;
+  ok(S.Bank.data[1][1] === Math.round((140000 + 1100 * 0.91 + fundNow) * 100) / 100, 'total EUR balance incl. savings fund ' + S.Bank.data[1][1]);
+  ok(S.Bank.data[0][8] === Math.round((140000 + 1100 * 0.91) * 100) / 100 && S.Bank.data[1][8] === fundNow, 'accounts and fund shown apart');
   ok(S.Bank.data[6][0] === 'Main' && S.Bank.data[7][1] === 'USD' && !S.Bank.data.some(r => r[0] === 'Old'), 'accounts table, inactive left out');
   ok(/^OK /.test(S.Bank.data[2][1]), 'status OK');
   const T = S['Bank transactions'].data;
-  ok(T[0][0] === 'Date' && T.length === 1 + 10, 'header and 10 leg rows (' + T.length + ')');
+  ok(T[0][0] === 'Date' && T.length === 1 + 15, 'header and 15 leg rows (' + T.length + ')');
   const row = id => T.find(r => r[12] === id);
+  ok(row('t10:l10')[10] === 'Internal transfer' && row('t11:l11a')[10] === 'Internal transfer' && row('t11:l11b')[10] === 'Internal transfer', 'savings moves internal, both legs');
+  ok(row('t12:l12')[10] === 'Money in (other)', 'fund interest is income');
+  ok(row('t13:l13')[10] !== 'Internal transfer', 'Compound & Growth Partners is not the savings fund');
+  
   ok(row('t1:l1')[10] === 'Client payment' && row('t1:l1')[11] === 'INV-31', 't1 client payment INV-31');
   ok(row('t3:l3')[10] === 'Software', 'slack software');
   ok(row('t4:l4')[10] === 'Salary', 'salary rule');
@@ -195,8 +212,8 @@ function verifySig(url, o, props) {
   const C = S['Monthly check-ins'].data;
   // Oct end = total - completed EUR after 2026-11-01 (t1 15000, t3 -8.25, t5 -1000 and +1001, t7 -30, t8 5000, t9 -101.47)
   const total = 140000 + 1100 * 0.91;
-  const after = 15000 - 8.25 - 1000 + Math.round(1100 * 0.91 * 100) / 100 - 30 + 5000 + Math.round(-111.5 * 0.91 * 100) / 100;
-  ok(Math.abs(C[1][1] - (total - after)) < 0.02, 'October month-end balance ' + C[1][1] + ' vs ' + (total - after));
+  const after = 15000 - 8.25 - 1000 + Math.round(1100 * 0.91 * 100) / 100 - 30 + 5000 + Math.round(-111.5 * 0.91 * 100) / 100 - 15000 + 500 - 7500;
+  ok(Math.abs(C[1][1] - (total - after + 100000)) < 0.02, 'October month-end balance incl. fund ' + C[1][1] + ' vs ' + (total - after + 100000));
   ok(C[2][1] === '', 'November not over: left empty');
   ok(C[3][1] === '', 'month before synced history: left empty');
   ok(e.calls.every(c => c.o.method === 'get'), 'only GET calls to the API');
@@ -206,8 +223,16 @@ function verifySig(url, o, props) {
   // second sync: idempotent
   e.sent.length = 0;
   e.m.syncRevolut();
-  ok(S['Bank transactions'].data.filter(r => r[12]).length === 11, 'no duplicate rows on re-sync');
+  ok(S['Bank transactions'].data.filter(r => r[12]).length === 16, 'no duplicate rows on re-sync');
   ok(e.sent.length === 0, 'no repeated emails on re-sync');
+}
+// without a typed fund balance: accounts only, no month-end balances, status says so
+{
+  const e = env({ props: connected, noFund: true });
+  e.m.syncRevolut();
+  ok(e.sheets.Bank.data[1][1] === Math.round((140000 + 1100 * 0.91) * 100) / 100 && e.sheets.Bank.data[1][8] === 'Not set', 'no fund: accounts only');
+  ok(e.sheets['Monthly check-ins'].data[1][1] === '', 'no fund: month-end balances left empty');
+  ok(/Savings fund \(Compound\) balance not set/.test(e.sheets.Bank.data[2][1]), 'no fund: status asks for it');
 }
 // pagination
 {
