@@ -1,6 +1,6 @@
 /**
  * GTM Talent - Cash flow monthly update (Google Apps Script, bound to the
- * "GTM Talent - Cash Flow Model" sheet)                         version 0.1.0
+ * "GTM Talent - Cash Flow Model" sheet)                         version 0.2.0
  *
  * On the 1st of every month it:
  *   1. reads the Revolut Business emails that the Invoice Archiver saved in the
@@ -292,12 +292,20 @@ function buildEmail_(changes, checkin, st, today, failure) {
     (stale ? 'update the bank balance' : 'monthly update') +
     (changes.paid.length ? `, ${changes.paid.length} payment(s) recorded` : '');
   const sections = [];
-  sections.push(['Do this now (2 minutes)', [
-    `Type today's Revolut balance (all accounts) on Inputs: date in B5, amount in B6.` +
-      (st.balanceDate ? ` It now says ${euro_(Number(st.cash))} on ${st.balanceDate}` +
-        (st.balanceAge !== null ? ` (${st.balanceAge} days ago).` : '.') : ''),
-    'On Monthly check-ins, type last month\'s real month-end balance in column B so it can be compared with the forecast.',
-  ]]);
+  if (stale) {
+    sections.push(['Do this now (2 minutes)', [
+      `The bank balance the forecast starts from is out of date` +
+        (st.balanceDate ? `: ${euro_(Number(st.cash))} on ${st.balanceDate}` +
+          (st.balanceAge !== null ? ` (${st.balanceAge} days ago).` : '.') : '.') +
+        ' If the Revolut sync is set up, check its status on the Bank tab (cell B3). ' +
+        'Otherwise type today\'s Revolut balance (all accounts) on Inputs: date in B40, amount in B41.',
+      'On Monthly check-ins, type last month\'s real month-end balance in column B if it is empty.',
+    ]]);
+  } else {
+    sections.push(['Bank balance', [
+      `The forecast starts from ${euro_(Number(st.cash))} on ${st.balanceDate}.`,
+    ]]);
+  }
   sections.push(['Recorded from Revolut', [
     ...changes.paid.map(l => `Paid: ${l}`),
     ...changes.added.map(l => `New invoice: ${l}`),
